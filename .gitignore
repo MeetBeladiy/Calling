@@ -1,0 +1,16 @@
+.gradle/
+.kotlin/
+.idea/
+**/build/
+local.properties
+*.iml
+.DS_Store
+*.apk
+backend/node_modules/
+backend/dist/
+backend/.env
+backend/data/
+app/google-services.json
+*.jks
+*.keystore
+
