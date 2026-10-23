@@ -61,6 +61,7 @@ describe("WebSocket signaling", () => {
     const [incoming, created] = await Promise.all([incomingPromise, createdPromise]);
     expect(incoming.from).toBe(alice.user.id);
     expect(incoming.callId).toBe(created.callId);
+    expect(incoming.startedAt).toEqual(expect.any(Number));
 
     const acceptedPromise = nextMessage(aliceSocket, "call.accept");
     bobSocket.send(JSON.stringify({ type: "call.accept", callId: created.callId }));

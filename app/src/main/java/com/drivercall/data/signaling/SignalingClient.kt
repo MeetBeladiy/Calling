@@ -4,6 +4,7 @@ import com.drivercall.BuildConfig
 import com.drivercall.data.rtc.RtcIceCandidate
 import com.drivercall.data.security.TokenStorage
 import com.google.gson.JsonObject
+import com.google.gson.JsonElement
 import com.google.gson.JsonParser
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -21,6 +22,7 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import java.util.UUID
+import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -238,7 +240,7 @@ class OkHttpSignalingClient @Inject constructor(
                 SignalingEvent.Incoming(
                     callId,
                     json.string("from").orEmpty(),
-                    json.number("startedAt")?.toLong() ?: System.currentTimeMillis()
+                    parseSignalTimestamp(json.get("startedAt"))
                 )
             )
             "call.accept" -> if (callId != null) mutableEvents.tryEmit(
@@ -299,4 +301,16 @@ internal fun signalingHttpUrl(configuredUrl: String): HttpUrl {
         else -> configuredUrl
     }
     return normalized.toHttpUrl()
+}
+
+/** Accept both the current epoch-millisecond payload and older ISO-8601 servers. */
+internal fun parseSignalTimestamp(
+    value: JsonElement?,
+    fallbackEpochMs: Long = System.currentTimeMillis()
+): Long {
+    if (value == null || value.isJsonNull || !value.isJsonPrimitive) return fallbackEpochMs
+    val primitive = value.asJsonPrimitive
+    if (primitive.isNumber) return runCatching { primitive.asLong }.getOrDefault(fallbackEpochMs)
+    return runCatching { Instant.parse(primitive.asString).toEpochMilli() }
+        .getOrDefault(fallbackEpochMs)
 }

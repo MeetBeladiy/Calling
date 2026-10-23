@@ -140,7 +140,12 @@ export class SignalingHub implements PresenceReader {
       case "call.invite": {
         const call = await this.calls.startVoip(socket.userId, message.to);
         this.send(socket, { type: "call.created", callId: call.id, to: message.to, requestId: message.requestId });
-        const delivered = this.sendTo(message.to, { type: "call.incoming", callId: call.id, from: socket.userId, startedAt: call.startedAt });
+        const delivered = this.sendTo(message.to, {
+          type: "call.incoming",
+          callId: call.id,
+          from: socket.userId,
+          startedAt: new Date(call.startedAt).getTime()
+        });
         if (!delivered) this.send(socket, { type: "peer.unavailable", callId: call.id, userId: message.to });
         return;
       }
