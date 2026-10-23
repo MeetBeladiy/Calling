@@ -21,6 +21,7 @@ import com.drivercall.domain.model.CallRecord
 import com.drivercall.domain.model.CallType
 import com.drivercall.domain.model.NetworkStatus
 import com.drivercall.domain.repository.CallHistoryRepository
+import com.drivercall.domain.repository.AuthRepository
 import com.drivercall.service.CallForegroundService
 import com.drivercall.service.CallNotificationManager
 import com.drivercall.telecom.CellularCallMonitor
@@ -34,6 +35,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicBoolean
@@ -52,7 +55,8 @@ class DefaultCallCoordinator @Inject constructor(
     private val telecom: TelecomCallController,
     private val notifications: CallNotificationManager,
     private val sessionStore: CallSessionStore,
-    private val historyRepository: CallHistoryRepository
+    private val historyRepository: CallHistoryRepository,
+    private val authRepository: AuthRepository
 ) : CallCoordinator, WebRtcListener {
     private val restoredSession = sessionStore.restore()
     private val machine = CallStateMachine(
@@ -80,6 +84,7 @@ class DefaultCallCoordinator @Inject constructor(
     private var customerCallStartedAt: Long? = null
     private var customerCallObservedOffhook = false
     private var customerDisplayName = "Customer"
+    private var presenceUserId: String? = null
 
     init {
         // A native PeerConnection cannot survive process death. Keep enough data
@@ -88,6 +93,22 @@ class DefaultCallCoordinator @Inject constructor(
         if (restoredSession?.hasLiveSession == true) sessionStore.clear()
         rtc.setListener(this)
         scope.launch { signaling.events.collectLatest(::handleSignalingEvent) }
+        scope.launch {
+            authRepository.observeSession().collectLatest { session ->
+                val nextUserId = session?.user?.id
+                if (presenceUserId != nextUserId) signaling.disconnect()
+                presenceUserId = nextUserId
+                if (session == null) return@collectLatest
+
+                // Keep the authenticated signaling socket alive while the user is
+                // signed in. This is both the online-presence channel and the path
+                // used to deliver incoming calls while the app process is running.
+                while (currentCoroutineContext().isActive) {
+                    runCatching { signaling.connect() }
+                    delay(15_000)
+                }
+            }
+        }
         scope.launch { networkMonitor.networkStatus.collectLatest(::handleNetworkStatus) }
         scope.launch { cellularCallMonitor.states.collectLatest(::handleCellularCallState) }
         scope.launch {
@@ -564,7 +585,6 @@ class DefaultCallCoordinator @Inject constructor(
                 )
             }
             sessionStore.clear()
-            signaling.disconnect()
             pendingOffer = null
             incomingAccepted = false
             delay(1_000)

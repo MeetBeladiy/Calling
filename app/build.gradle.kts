@@ -31,8 +31,8 @@ android {
         applicationId = "com.drivercall"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
-        versionName = "0.8.1-mvp"
+        versionCode = 3
+        versionName = "0.8.2-mvp"
 
         buildConfigField("String", "BASE_URL", "\"${apiBaseUrl.get()}\"")
         buildConfigField("String", "SIGNALING_URL", "\"${signalingUrl.get()}\"")
