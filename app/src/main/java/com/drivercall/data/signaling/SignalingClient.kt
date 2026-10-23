@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -85,7 +86,7 @@ class OkHttpSignalingClient @Inject constructor(
         val token = tokenStorage.getToken()
             ?: throw IllegalStateException("Sign in before starting a call")
         openSignal = CompletableDeferred()
-        val url = BuildConfig.SIGNALING_URL.toHttpUrl().newBuilder()
+        val url = signalingHttpUrl(BuildConfig.SIGNALING_URL).newBuilder()
             .addQueryParameter("token", token)
             .build()
         // Never log this request: its URL contains the short-lived access token.
@@ -282,4 +283,20 @@ class OkHttpSignalingClient @Inject constructor(
         get(name)?.takeUnless { it.isJsonNull }?.asString
     private fun JsonObject.number(name: String): Number? =
         get(name)?.takeUnless { it.isJsonNull }?.asNumber
+}
+
+/**
+ * OkHttp performs the WebSocket upgrade from an HTTP(S) request. Its HttpUrl
+ * parser intentionally rejects ws/wss schemes, so normalize the configured
+ * WebSocket URL before constructing the request.
+ */
+internal fun signalingHttpUrl(configuredUrl: String): HttpUrl {
+    val normalized = when {
+        configuredUrl.startsWith("wss://", ignoreCase = true) ->
+            "https://${configuredUrl.substring(6)}"
+        configuredUrl.startsWith("ws://", ignoreCase = true) ->
+            "http://${configuredUrl.substring(5)}"
+        else -> configuredUrl
+    }
+    return normalized.toHttpUrl()
 }
