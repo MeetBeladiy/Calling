@@ -66,11 +66,11 @@ fun ActiveCallScreen(
     val endpoints by viewModel.audioEndpoints.collectAsState()
     val selectedEndpoint by viewModel.currentAudioEndpoint.collectAsState()
     var showAudio by remember { mutableStateOf(false) }
-    var sawLiveSession by remember { mutableStateOf(state.hasLiveSession) }
+    var sawCallSession by remember { mutableStateOf(state.shouldShowCallUi) }
 
-    LaunchedEffect(state.hasLiveSession) {
-        if (state.hasLiveSession) sawLiveSession = true
-        else if (sawLiveSession) onBack()
+    LaunchedEffect(state.shouldShowCallUi) {
+        if (state.shouldShowCallUi) sawCallSession = true
+        else if (sawCallSession) onBack()
     }
 
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -180,10 +180,15 @@ private fun StatusCard(state: CallState) {
                 Text(state.quality.displayName(), style = MaterialTheme.typography.titleMedium, color = qualityColor(state.quality))
             }
             Column(horizontalAlignment = Alignment.End) {
-                Text("Network", style = MaterialTheme.typography.bodyMedium)
-                Text(state.diagnostics.networkLabel, style = MaterialTheme.typography.titleMedium)
+                Text("Noise cancellation", style = MaterialTheme.typography.bodyMedium)
+                Text("On", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
             }
         }
+        Text(
+            "Network: ${state.diagnostics.networkLabel}",
+            modifier = Modifier.padding(start = 14.dp, end = 14.dp, bottom = 14.dp),
+            style = MaterialTheme.typography.bodyMedium
+        )
     }
 }
 

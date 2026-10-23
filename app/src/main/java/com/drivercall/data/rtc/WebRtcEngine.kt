@@ -56,7 +56,9 @@ interface WebRtcEngine {
 
 /**
  * Audio-only WebRTC transport. WebRTC supplies DTLS-SRTP media encryption,
- * Opus, jitter buffering, packet-loss concealment, AEC, NS and AGC.
+ * Opus, jitter buffering and packet-loss concealment. Microphone processing is
+ * always enabled: hardware AEC/NS where supported, with WebRTC software echo
+ * cancellation, noise suppression, automatic gain and high-pass filtering.
  */
 @Singleton
 class AndroidWebRtcEngine @Inject constructor(
@@ -136,6 +138,8 @@ class AndroidWebRtcEngine @Inject constructor(
         }
 
         val processingConstraints = MediaConstraints().apply {
+            // The software constraints remain enabled even when a device does not
+            // provide working hardware effects, giving every call an NS/AEC path.
             mandatory += MediaConstraints.KeyValuePair("googEchoCancellation", "true")
             mandatory += MediaConstraints.KeyValuePair("googNoiseSuppression", "true")
             mandatory += MediaConstraints.KeyValuePair("googAutoGainControl", "true")

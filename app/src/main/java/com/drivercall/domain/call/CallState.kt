@@ -58,6 +58,10 @@ data class CallState(
     val hasLiveSession: Boolean
         get() = stage !in setOf(CallStage.IDLE, CallStage.CALL_ENDED, CallStage.VOIP_DISCONNECTED)
 
+    /** Keep recoverable failures visible so the user can retry or end the call. */
+    val shouldShowCallUi: Boolean
+        get() = callId != null && stage != CallStage.IDLE
+
     val canTalk: Boolean
         get() = stage in setOf(CallStage.CONNECTED, CallStage.POOR_CONNECTION, CallStage.VOIP_RESTORED)
 }

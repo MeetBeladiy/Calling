@@ -43,8 +43,8 @@ fun DriverCallNavGraph(
         Routes.NetworkDiagnostics.route
     )
 
-    LaunchedEffect(callState.callId, callState.hasLiveSession, currentRoute) {
-        if (callState.hasLiveSession && currentRoute !in callRoutes &&
+    LaunchedEffect(callState.callId, callState.shouldShowCallUi, currentRoute) {
+        if (callState.shouldShowCallUi && currentRoute !in callRoutes &&
             currentRoute !in setOf(Routes.Splash.route, Routes.Login.route, Routes.Register.route)
         ) {
             navController.navigate(Routes.ActiveCall.route) { launchSingleTop = true }

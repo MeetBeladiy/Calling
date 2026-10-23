@@ -2,6 +2,7 @@ package com.drivercall.domain.call
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CallStateMachineTest {
@@ -84,5 +85,32 @@ class CallStateMachineTest {
         assertEquals(CallStage.OUTGOING_VOIP_CALL, assigned.stage)
         assertEquals("server-call-1", assigned.callId)
         assertEquals("friend-1", assigned.peerId)
+    }
+
+    @Test
+    fun `recoverable call failure keeps call UI visible for retry`() {
+        val outgoing = CallStateMachine.reduce(
+            CallState(),
+            CallEvent.StartOutgoing("pending-1", "friend-1", "Sarah", 100)
+        )
+        val failed = CallStateMachine.reduce(
+            outgoing,
+            CallEvent.Failed("pending-1", "Call server timed out")
+        )
+
+        assertEquals(CallStage.VOIP_DISCONNECTED, failed.stage)
+        assertFalse(failed.hasLiveSession)
+        assertTrue(failed.shouldShowCallUi)
+    }
+
+    @Test
+    fun `reset removes completed call UI`() {
+        val ended = CallState(
+            stage = CallStage.CALL_ENDED,
+            callId = "call-1"
+        )
+
+        assertTrue(ended.shouldShowCallUi)
+        assertFalse(CallStateMachine.reduce(ended, CallEvent.Reset).shouldShowCallUi)
     }
 }
