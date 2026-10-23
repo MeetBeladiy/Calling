@@ -34,7 +34,7 @@ class FriendRepositoryImpl @Inject constructor(
                     name = entity.name,
                     profilePhotoUrl = entity.profilePhotoUrl,
                     status = runCatching { FriendStatus.valueOf(entity.status) }
-                        .getOrDefault(FriendStatus.PENDING),
+                        .getOrDefault(FriendStatus.PENDING_OUTGOING),
                     isOnline = entity.isOnline,
                     lastActiveAt = entity.lastActiveAt
                 )
@@ -44,7 +44,7 @@ class FriendRepositoryImpl @Inject constructor(
     override suspend fun refreshFriends(): Result<Unit> {
         return try {
             val dtos = friendApi.getFriends().friends
-            friendDao.upsertAll(dtos.map { it.toEntity() })
+            friendDao.replaceAll(dtos.map { it.toEntity() })
             Result.Success(Unit)
         } catch (e: IOException) {
             Result.Error("No internet connection.", e)

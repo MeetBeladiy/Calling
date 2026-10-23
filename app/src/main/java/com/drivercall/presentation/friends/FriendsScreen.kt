@@ -16,6 +16,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Card
@@ -53,6 +54,9 @@ fun FriendsScreen(
     val friends by viewModel.friends.collectAsState()
     val state = viewModel.uiState
     val snackbarHost = remember { SnackbarHostState() }
+    val incomingRequests = friends.filter { it.status == FriendStatus.PENDING_INCOMING }
+    val acceptedFriends = friends.filter { it.status == FriendStatus.ACCEPTED }
+    val sentRequests = friends.filter { it.status == FriendStatus.PENDING_OUTGOING }
 
     LaunchedEffect(state.actionMessage) {
         state.actionMessage?.let {
@@ -64,6 +68,15 @@ fun FriendsScreen(
     ScreenScaffold(
         title = "Friends",
         onBack = onBack,
+        actions = {
+            IconButton(onClick = viewModel::refresh, enabled = !state.isRefreshing) {
+                if (state.isRefreshing) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Filled.Refresh, contentDescription = "Refresh friend requests")
+                }
+            }
+        },
         snackbarHostState = snackbarHost
     ) { padding ->
         Column(
@@ -103,15 +116,34 @@ fun FriendsScreen(
                     item { Spacer(Modifier.height(8.dp)) }
                 }
 
+                if (incomingRequests.isNotEmpty()) {
+                    item {
+                        Text(
+                            text = "Friend requests (${incomingRequests.size})",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                        )
+                    }
+                    items(incomingRequests, key = { it.id }) { friend ->
+                        FriendRow(
+                            friend = friend,
+                            onClick = { onFriendClick(friend.id) },
+                            onAccept = { viewModel.acceptInvite(friend) }
+                        )
+                    }
+                    item { Spacer(Modifier.height(8.dp)) }
+                }
+
                 item {
                     Text(
-                        text = "Your friends (${friends.size})",
+                        text = "Your friends (${acceptedFriends.size})",
                         style = MaterialTheme.typography.titleMedium,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
                     )
                 }
 
-                if (friends.isEmpty() && !state.isRefreshing) {
+                if (acceptedFriends.isEmpty() && incomingRequests.isEmpty() && sentRequests.isEmpty() && !state.isRefreshing) {
                     item {
                         EmptyState(
                             title = "No friends yet",
@@ -120,12 +152,29 @@ fun FriendsScreen(
                     }
                 }
 
-                items(friends, key = { it.id }) { friend ->
+                items(acceptedFriends, key = { it.id }) { friend ->
                     FriendRow(
                         friend = friend,
                         onClick = { onFriendClick(friend.id) },
-                        onAccept = { viewModel.acceptInvite(friend) }
+                        onAccept = null
                     )
+                }
+
+                if (sentRequests.isNotEmpty()) {
+                    item {
+                        Text(
+                            text = "Sent requests (${sentRequests.size})",
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                        )
+                    }
+                    items(sentRequests, key = { it.id }) { friend ->
+                        FriendRow(
+                            friend = friend,
+                            onClick = { onFriendClick(friend.id) },
+                            onAccept = null
+                        )
+                    }
                 }
             }
         }
@@ -137,7 +186,7 @@ fun FriendsScreen(
 private fun FriendRow(
     friend: Friend,
     onClick: () -> Unit,
-    onAccept: () -> Unit
+    onAccept: (() -> Unit)?
 ) {
     Card(
         onClick = onClick,
@@ -175,14 +224,15 @@ private fun FriendRow(
                 Text(
                     text = when (friend.status) {
                         FriendStatus.ACCEPTED -> if (friend.isOnline) "Online" else "Offline"
-                        FriendStatus.PENDING -> "Invitation pending"
+                        FriendStatus.PENDING_INCOMING -> "Wants to be your friend"
+                        FriendStatus.PENDING_OUTGOING -> "Waiting for acceptance"
                         FriendStatus.BLOCKED -> "Blocked"
                     },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            if (friend.status == FriendStatus.PENDING) {
+            if (onAccept != null) {
                 IconButton(onClick = onAccept) {
                     Icon(Icons.Filled.Check, contentDescription = "Accept invitation")
                 }

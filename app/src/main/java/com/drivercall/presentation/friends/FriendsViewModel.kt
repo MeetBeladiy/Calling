@@ -18,7 +18,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import javax.inject.Inject
 
 data class FriendsUiState(
@@ -44,17 +47,32 @@ class FriendsViewModel @Inject constructor(
         private set
 
     private var searchJob: Job? = null
+    private val refreshMutex = Mutex()
 
     init {
-        refresh()
+        viewModelScope.launch {
+            while (isActive) {
+                refreshFriends(showError = false)
+                delay(5_000)
+            }
+        }
     }
 
     fun refresh() {
         viewModelScope.launch {
-            uiState = uiState.copy(isRefreshing = true)
-            getFriendsUseCase.refresh()
-            uiState = uiState.copy(isRefreshing = false)
+            refreshFriends(showError = true)
         }
+    }
+
+    private suspend fun refreshFriends(showError: Boolean) = refreshMutex.withLock {
+        uiState = uiState.copy(isRefreshing = true)
+        when (val result = getFriendsUseCase.refresh()) {
+            is Result.Error -> if (showError) {
+                uiState = uiState.copy(actionMessage = result.message)
+            }
+            else -> Unit
+        }
+        uiState = uiState.copy(isRefreshing = false)
     }
 
     fun onSearchQueryChange(query: String) {

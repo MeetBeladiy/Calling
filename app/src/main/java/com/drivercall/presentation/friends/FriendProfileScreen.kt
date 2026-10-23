@@ -93,7 +93,8 @@ fun FriendProfileScreen(
             Text(
                 text = when (current.status) {
                     FriendStatus.ACCEPTED -> if (current.isOnline) "Online now" else lastActiveText(current.lastActiveAt)
-                    FriendStatus.PENDING -> "Invitation pending"
+                    FriendStatus.PENDING_INCOMING -> "Friend request received"
+                    FriendStatus.PENDING_OUTGOING -> "Friend request sent"
                     FriendStatus.BLOCKED -> "Blocked"
                 },
                 style = MaterialTheme.typography.bodyMedium,

@@ -1,7 +1,8 @@
 package com.drivercall.domain.model
 
 enum class FriendStatus {
-    PENDING,    // invitation sent, awaiting response
+    PENDING_INCOMING, // invitation received; this user can accept it
+    PENDING_OUTGOING, // invitation sent; waiting for the other user
     ACCEPTED,   // both sides can call each other
     BLOCKED     // user blocked this contact
 }

@@ -112,8 +112,7 @@ fun FriendDto.toDomain(): Friend = Friend(
     friendUserId = user.id,
     name = user.name,
     profilePhotoUrl = user.profilePhotoUrl,
-    status = runCatching { FriendStatus.valueOf(status.uppercase()) }
-        .getOrDefault(FriendStatus.PENDING),
+    status = toFriendStatus(),
     isOnline = user.isOnline,
     lastActiveAt = user.lastActiveAt?.toEpochMillis()
 )
@@ -123,10 +122,19 @@ fun FriendDto.toEntity(): FriendEntity = FriendEntity(
     friendUserId = user.id,
     name = user.name,
     profilePhotoUrl = user.profilePhotoUrl,
-    status = status.uppercase(),
+    status = toFriendStatus().name,
     isOnline = user.isOnline,
     lastActiveAt = user.lastActiveAt?.toEpochMillis()
 )
+
+private fun FriendDto.toFriendStatus(): FriendStatus = when (status.lowercase()) {
+    "accepted" -> FriendStatus.ACCEPTED
+    else -> if (direction.equals("incoming", ignoreCase = true)) {
+        FriendStatus.PENDING_INCOMING
+    } else {
+        FriendStatus.PENDING_OUTGOING
+    }
+}
 
 data class FriendActionRequest(
     @SerializedName("userId") val userId: String
