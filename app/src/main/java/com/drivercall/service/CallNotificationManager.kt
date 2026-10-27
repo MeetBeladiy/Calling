@@ -69,7 +69,7 @@ class CallNotificationManager @Inject constructor(
             .setContentIntent(contentIntent)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setOngoing(state.hasLiveSession)
+            .setOngoing(state.shouldShowCallUi)
             .setOnlyAlertOnce(state.stage != CallStage.RINGING)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setStyle(style)
@@ -81,7 +81,7 @@ class CallNotificationManager @Inject constructor(
     }
 
     fun show(state: CallState) {
-        if (!state.hasLiveSession) {
+        if (!state.shouldShowCallUi) {
             cancel()
             return
         }

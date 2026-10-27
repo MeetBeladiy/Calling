@@ -23,6 +23,7 @@ import com.drivercall.domain.model.NetworkStatus
 import com.drivercall.domain.repository.CallHistoryRepository
 import com.drivercall.domain.repository.AuthRepository
 import com.drivercall.service.CallForegroundService
+import com.drivercall.service.CallAvailabilityService
 import com.drivercall.service.CallNotificationManager
 import com.drivercall.telecom.CellularCallMonitor
 import com.drivercall.telecom.CellularCallState
@@ -186,6 +187,7 @@ class DefaultCallCoordinator @Inject constructor(
     }
 
     private fun startCallInfrastructure(callId: String, peerName: String, incoming: Boolean) {
+        CallAvailabilityService.stop(context)
         notifications.show(state.value)
         CallForegroundService.start(context)
         telecomRegistration?.cancel()
@@ -207,6 +209,7 @@ class DefaultCallCoordinator @Inject constructor(
         val callId = snapshot.callId ?: return
         if (!snapshot.incoming || snapshot.stage != CallStage.RINGING || incomingAccepted) return
         incomingAccepted = true
+        CallForegroundService.enableMicrophone(context)
         runCatching { signaling.connect() }
             .onFailure {
                 incomingAccepted = false
@@ -587,6 +590,7 @@ class DefaultCallCoordinator @Inject constructor(
             sessionStore.clear()
             pendingOffer = null
             incomingAccepted = false
+            if (presenceUserId != null) CallAvailabilityService.start(context)
             delay(1_000)
             machine.dispatch(CallEvent.Reset)
             notifications.cancel()

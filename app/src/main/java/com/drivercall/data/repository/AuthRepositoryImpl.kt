@@ -1,5 +1,6 @@
 package com.drivercall.data.repository
 
+import android.content.Context
 import com.drivercall.data.local.dao.UserDao
 import com.drivercall.data.remote.AuthApi
 import com.drivercall.data.remote.UserApi
@@ -15,6 +16,8 @@ import com.drivercall.domain.model.AuthSession
 import com.drivercall.domain.model.User
 import com.drivercall.domain.repository.AuthRepository
 import com.drivercall.domain.util.Result
+import com.drivercall.service.CallAvailabilityService
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -28,6 +31,7 @@ import javax.inject.Singleton
 
 @Singleton
 class AuthRepositoryImpl @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val authApi: AuthApi,
     private val userApi: UserApi,
     private val userDao: UserDao,
@@ -49,6 +53,7 @@ class AuthRepositoryImpl @Inject constructor(
             val userDto = userApi.getMe().user
             userDao.upsert(userDto.toEntity())
             sessionState.value = AuthSession(userDto.toDomain(), token)
+            CallAvailabilityService.start(context)
             true
         } catch (e: HttpException) {
             if (e.code() == 401) logout()
@@ -59,6 +64,7 @@ class AuthRepositoryImpl @Inject constructor(
             val cached = userDao.getUser()
             if (cached != null) {
                 sessionState.value = AuthSession(cached.toDomain(), token)
+                CallAvailabilityService.start(context)
                 true
             } else {
                 false
@@ -115,6 +121,7 @@ class AuthRepositoryImpl @Inject constructor(
         tokenStorage.clear()
         userDao.clear()
         sessionState.value = null
+        CallAvailabilityService.stop(context)
     }
 
     override suspend fun requestPasswordReset(email: String): Result<Unit> = try {
@@ -136,6 +143,7 @@ class AuthRepositoryImpl @Inject constructor(
         userDao.upsert(entity)
         val session = AuthSession(user, accessToken)
         sessionState.value = session
+        CallAvailabilityService.start(context)
         return Result.Success(session)
     }
 
