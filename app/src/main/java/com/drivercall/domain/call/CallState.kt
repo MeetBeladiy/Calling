@@ -8,6 +8,7 @@ enum class CallStage {
     IDLE,
     OUTGOING_VOIP_CALL,
     RINGING,
+    NEGOTIATING,
     CONNECTED,
     RECONNECTING,
     POOR_CONNECTION,
@@ -87,8 +88,11 @@ sealed interface CallEvent {
     ) : CallEvent
 
     data class RemoteRinging(val callId: String) : CallEvent
+    data class Negotiating(val callId: String) : CallEvent
+    data class AcceptFailed(val callId: String, val reason: String) : CallEvent
     data class Connected(val callId: String, val nowEpochMs: Long) : CallEvent
     data class NetworkLost(val callId: String) : CallEvent
+    data class RetryStarted(val callId: String) : CallEvent
     data class NetworkAvailable(val callId: String, val label: String) : CallEvent
     data class IceRestartSucceeded(val callId: String) : CallEvent
     data class QualityChanged(

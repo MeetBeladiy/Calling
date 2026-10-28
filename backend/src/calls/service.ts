@@ -59,10 +59,85 @@ export class CallService {
   async answer(callId: string, userId: string): Promise<CallRecord> {
     return this.store.mutate((state) => {
       const call = state.calls.find((item) => item.id === callId && item.receiverId === userId && item.type === "voip");
+      // Retrying an acknowledgement after a transient socket loss must be safe.
+      if (call?.status === "connected") return structuredClone(call);
       if (!call || call.status !== "ringing") throw new HttpError(409, "Call is no longer ringing", "CALL_NOT_RINGING");
       call.status = "connected";
       call.answeredAt = new Date().toISOString();
       return structuredClone(call);
+    });
+  }
+
+  async failUndeliveredAnswer(callId: string, receiverId: string): Promise<CallRecord> {
+    return this.store.mutate((state) => {
+      const call = state.calls.find((item) =>
+        item.id === callId && item.receiverId === receiverId && item.type === "voip"
+      );
+      if (!call) throw new HttpError(404, "Call not found", "CALL_NOT_FOUND");
+
+      // call.accept is persisted before its WebSocket delivery is attempted. If
+      // the caller has disappeared, do not leave an unreachable connected call
+      // blocking both participants from every future call.
+      if (call.status === "connected") {
+        const endedAt = new Date();
+        call.endedAt = endedAt.toISOString();
+        call.status = "failed";
+        call.quality = call.quality ?? "unknown";
+        const basis = call.answeredAt ?? call.startedAt;
+        call.durationSeconds = Math.max(
+          0,
+          Math.round((endedAt.getTime() - new Date(basis).getTime()) / 1000)
+        );
+      }
+      return structuredClone(call);
+    });
+  }
+
+  async failActiveCallsForUser(
+    userId: string,
+    shouldFail: () => boolean = () => true
+  ): Promise<CallRecord[]> {
+    return this.store.mutate((state) => {
+      // The predicate runs inside the serialized mutation. A socket that
+      // reconnects while cleanup is queued can invalidate the cleanup before
+      // any persistent call state is changed.
+      if (!shouldFail()) return [];
+      const endedAt = new Date();
+      const failed: CallRecord[] = [];
+      for (const call of state.calls) {
+        if (call.type !== "voip" || !["ringing", "connected"].includes(call.status)) continue;
+        if (call.callerId !== userId && call.receiverId !== userId) continue;
+        call.endedAt = endedAt.toISOString();
+        call.status = "failed";
+        call.quality = call.quality ?? "unknown";
+        const basis = call.answeredAt ?? call.startedAt;
+        call.durationSeconds = Math.max(
+          0,
+          Math.round((endedAt.getTime() - new Date(basis).getTime()) / 1000)
+        );
+        failed.push(structuredClone(call));
+      }
+      return failed;
+    });
+  }
+
+  async failAllActiveCalls(): Promise<CallRecord[]> {
+    return this.store.mutate((state) => {
+      const endedAt = new Date();
+      const failed: CallRecord[] = [];
+      for (const call of state.calls) {
+        if (call.type !== "voip" || !["ringing", "connected"].includes(call.status)) continue;
+        call.endedAt = endedAt.toISOString();
+        call.status = "failed";
+        call.quality = call.quality ?? "unknown";
+        const basis = call.answeredAt ?? call.startedAt;
+        call.durationSeconds = Math.max(
+          0,
+          Math.round((endedAt.getTime() - new Date(basis).getTime()) / 1000)
+        );
+        failed.push(structuredClone(call));
+      }
+      return failed;
     });
   }
 

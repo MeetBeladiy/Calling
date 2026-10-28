@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.drivercall.domain.call.CallCoordinator
@@ -30,7 +31,10 @@ class CallForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        promoteToForeground(includeMicrophone = !coordinator.state.value.incoming)
+        // A sticky service can be recreated while the app has no visible activity.
+        // Promote without the while-in-use microphone type first; an explicit,
+        // eligible call action upgrades the service in onStartCommand below.
+        promoteToForeground(includeMicrophone = false)
         coordinator.state.onEach { state ->
             notifications.show(state)
             if (!state.shouldShowCallUi) stopSelf()
@@ -39,8 +43,10 @@ class CallForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         promoteToForeground(
-            includeMicrophone = intent?.action in setOf(ACTION_ACCEPT, ACTION_ENABLE_AUDIO) ||
-                !coordinator.state.value.incoming
+            includeMicrophone = callActionNeedsMicrophone(
+                action = intent?.action,
+                incoming = coordinator.state.value.incoming
+            )
         )
         when (intent?.action) {
             ACTION_ACCEPT -> coordinator.acceptIncoming()
@@ -84,13 +90,29 @@ class CallForegroundService : Service() {
         fun start(context: Context) {
             val intent = Intent(context, CallForegroundService::class.java).setAction(ACTION_SYNC)
             runCatching { ContextCompat.startForegroundService(context, intent) }
+                .onFailure { Log.e(TAG, "Could not start active-call service", it) }
         }
 
         fun enableMicrophone(context: Context) {
             val intent = Intent(context, CallForegroundService::class.java)
                 .setAction(ACTION_ENABLE_AUDIO)
             runCatching { ContextCompat.startForegroundService(context, intent) }
+                .onFailure { Log.e(TAG, "Could not enable foreground call audio", it) }
         }
+
+        private const val TAG = "CallForeground"
     }
+}
+
+/**
+ * Only actions that originate from an eligible user-visible flow may add the
+ * while-in-use microphone foreground-service type. In particular, a null
+ * action is an Android START_STICKY recreation and must remain phone-call-only.
+ */
+internal fun callActionNeedsMicrophone(action: String?, incoming: Boolean): Boolean = when (action) {
+    CallForegroundService.ACTION_ACCEPT,
+    CallForegroundService.ACTION_ENABLE_AUDIO -> true
+    CallForegroundService.ACTION_SYNC -> !incoming
+    else -> false
 }
 

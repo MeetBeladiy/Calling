@@ -23,7 +23,6 @@ import com.drivercall.domain.model.NetworkStatus
 import com.drivercall.domain.repository.CallHistoryRepository
 import com.drivercall.domain.repository.AuthRepository
 import com.drivercall.service.CallForegroundService
-import com.drivercall.service.CallAvailabilityService
 import com.drivercall.service.CallNotificationManager
 import com.drivercall.telecom.CellularCallMonitor
 import com.drivercall.telecom.CellularCallState
@@ -31,19 +30,30 @@ import com.drivercall.telecom.TelecomCallController
 import com.drivercall.telecom.TelecomCallbacks
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeout
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
+
+private data class PendingRemoteOffer(
+    val sdp: String,
+    val negotiationId: String?
+)
 
 @Singleton
 class DefaultCallCoordinator @Inject constructor(
@@ -62,10 +72,12 @@ class DefaultCallCoordinator @Inject constructor(
     private val restoredSession = sessionStore.restore()
     private val machine = CallStateMachine(
         restoredSession?.let { restored ->
-            if (restored.hasLiveSession) {
+            if (restored.incoming && restored.stage == CallStage.RINGING) {
+                restored
+            } else if (restored.shouldShowCallUi) {
                 restored.copy(
                     stage = CallStage.VOIP_DISCONNECTED,
-                    quality = CallQuality.NO_INTERNET,
+                    quality = CallQuality.UNKNOWN,
                     statusMessage = "Call was interrupted. Tap Retry to reconnect."
                 )
             } else restored
@@ -76,10 +88,32 @@ class DefaultCallCoordinator @Inject constructor(
     override val currentAudioEndpoint: StateFlow<CallAudioEndpoint?> = telecom.currentEndpoint
 
     private val negotiationMutex = Mutex()
+    private val recoveryMutex = Mutex()
+    private val acceptMutex = Mutex()
     private val ending = AtomicBoolean(false)
-    private var pendingOffer: String? = null
-    private var incomingAccepted = false
+    private val starting = AtomicBoolean(false)
+    private var pendingOffer: PendingRemoteOffer? = null
+    private var incomingAccepted = restoredSession?.let {
+        it.incoming && it.stage != CallStage.RINGING
+    } ?: false
+    private var restoredUnacceptedOutgoing = restoredSession?.let {
+        !it.incoming && it.stage in setOf(CallStage.OUTGOING_VOIP_CALL, CallStage.RINGING)
+    } ?: false
+    private var initialOfferSentCallId: String? = null
+    private var localOfferCallId: String? = null
+    @Volatile private var activeLocalNegotiationId: String? = null
+    @Volatile private var activeLocalAllowsLegacySignals = false
+    @Volatile private var activeRemoteNegotiationId: String? = null
+    @Volatile private var localCandidateNegotiationId: String? = null
+    @Volatile private var reconnectRequestedCallId: String? = null
+    private val pendingLocalCandidates = mutableListOf<RtcIceCandidate>()
+    @Volatile private var localDescriptionAnnounced = true
+    private var negotiationTimeoutJob: Job? = null
+    private var ringTimeoutJob: Job? = null
+    private var iceDisconnectJob: Job? = null
+    @Volatile private var rtcConnectionState = RtcConnectionState.NEW
     private var telecomRegistration: Job? = null
+    private var telecomAnswerWaiter: Job? = null
     private var lastNetwork: NetworkStatus? = null
     private var lastNetworkLabel = "Checking connection"
     private var customerCallStartedAt: Long? = null
@@ -88,16 +122,37 @@ class DefaultCallCoordinator @Inject constructor(
     private var presenceUserId: String? = null
 
     init {
-        // A native PeerConnection cannot survive process death. Keep enough data
-        // in memory to offer a retry, but never present a restored snapshot as a
-        // live call or repeatedly resurrect it on every process start.
-        if (restoredSession?.hasLiveSession == true) sessionStore.clear()
+        // A native PeerConnection cannot survive process death. Preserve the call
+        // role and ringing state so receivers can still Accept; accepted calls are
+        // restored as an explicit Retry flow with a fresh PeerConnection.
         rtc.setListener(this)
-        scope.launch { signaling.events.collectLatest(::handleSignalingEvent) }
+        // SDP and trickled ICE are an ordered protocol. collectLatest would cancel
+        // an in-flight setRemoteDescription as soon as the next ICE event arrived.
+        scope.launch {
+            signaling.events.collect { event ->
+                try {
+                    handleSignalingEvent(event)
+                } catch (timeout: TimeoutCancellationException) {
+                    // A signaling/SDP timeout is a recoverable call failure. It must
+                    // never cancel this long-lived collector and break later calls.
+                    state.value.callId?.let {
+                        failNegotiation(it, "Call setup timed out. Tap Retry.")
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Throwable) {
+                    state.value.callId?.let {
+                        failNegotiation(it, "Unable to secure call audio. Tap Retry.")
+                    }
+                }
+            }
+        }
         scope.launch {
             authRepository.observeSession().collectLatest { session ->
                 val nextUserId = session?.user?.id
-                if (presenceUserId != nextUserId) signaling.disconnect()
+                if (shouldDisconnectPresence(presenceUserId, nextUserId)) {
+                    signaling.disconnect()
+                }
                 presenceUserId = nextUserId
                 if (session == null) return@collectLatest
 
@@ -135,30 +190,61 @@ class DefaultCallCoordinator @Inject constructor(
                 }
             }
         }
+        state.value.takeIf { it.shouldShowCallUi }?.let { restored ->
+            notifications.show(restored)
+            restored.callId?.let { callId ->
+                telecomRegistration = scope.launch {
+                    runCatching {
+                        telecom.registerCall(
+                            callId,
+                            restored.peerName,
+                            restored.incoming,
+                            telecomCallbacks
+                        )
+                    }
+                }
+            }
+        }
     }
 
     override fun startOutgoing(peerId: String, peerName: String) {
-        if (state.value.hasLiveSession || ending.get()) return
+        if (state.value.hasLiveSession || ending.get() ||
+            !starting.compareAndSet(false, true)
+        ) return
         scope.launch {
-            val provisionalCallId = "pending-${UUID.randomUUID()}"
-            transition(
-                CallEvent.StartOutgoing(
-                    provisionalCallId,
-                    peerId,
-                    peerName,
-                    System.currentTimeMillis()
+            try {
+                val provisionalCallId = "pending-${UUID.randomUUID()}"
+                initialOfferSentCallId = null
+                localOfferCallId = null
+                val started = transition(
+                    CallEvent.StartOutgoing(
+                        provisionalCallId,
+                        peerId,
+                        peerName,
+                        System.currentTimeMillis()
+                    )
                 )
-            )
-            runCatching {
+                if (started.callId != provisionalCallId ||
+                    started.stage != CallStage.OUTGOING_VOIP_CALL
+                ) return@launch
                 signaling.connect()
                 val callId = signaling.createCall(peerId)
                 transition(CallEvent.AssignServerCallId(provisionalCallId, callId))
                 startCallInfrastructure(callId, peerName, incoming = false)
-                val offer = negotiationMutex.withLock { rtc.createOffer() }
-                signaling.sendOffer(callId, peerId, offer)
-            }.onFailure { error ->
-                val callId = state.value.callId ?: provisionalCallId
+                transition(CallEvent.RemoteRinging(callId))
+                armRingTimeout(callId)
+                // The receiver explicitly accepts before media negotiation starts.
+                // This prevents an offer from being lost while their app reconnects.
+            } catch (_: TimeoutCancellationException) {
+                val callId = state.value.callId ?: return@launch
+                transition(CallEvent.Failed(callId, "Call server timed out. Tap Retry."))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                val callId = state.value.callId ?: return@launch
                 transition(CallEvent.Failed(callId, error.userFacingMessage()))
+            } finally {
+                starting.set(false)
             }
         }
     }
@@ -176,18 +262,27 @@ class DefaultCallCoordinator @Inject constructor(
         val current = state.value
         if (current.callId == callId && current.hasLiveSession) return
         if (current.hasLiveSession) {
-            signaling.decline(callId)
+            runCatching {
+                withTimeout(END_SIGNAL_TIMEOUT_MS) { signaling.decline(callId) }
+            }
             return
         }
         incomingAccepted = false
         pendingOffer = null
-        transition(CallEvent.ReceiveIncoming(callId, peerId, peerName, startedAt))
+        val received = transition(CallEvent.ReceiveIncoming(callId, peerId, peerName, startedAt))
+        if (received.callId != callId || !received.incoming) {
+            runCatching {
+                withTimeout(END_SIGNAL_TIMEOUT_MS) { signaling.decline(callId) }
+            }
+            return
+        }
         startCallInfrastructure(callId, peerName, incoming = true)
         runCatching { signaling.connect() }
     }
 
     private fun startCallInfrastructure(callId: String, peerName: String, incoming: Boolean) {
-        CallAvailabilityService.stop(context)
+        // Keep the availability FGS alive throughout the call. Stopping it before
+        // launching another FGS can leave the app with no service on Android 12+.
         notifications.show(state.value)
         CallForegroundService.start(context)
         telecomRegistration?.cancel()
@@ -204,30 +299,59 @@ class DefaultCallCoordinator @Inject constructor(
         scope.launch { acceptIncomingInternal(fromTelecom = false) }
     }
 
-    private suspend fun acceptIncomingInternal(fromTelecom: Boolean) {
+    private suspend fun acceptIncomingInternal(fromTelecom: Boolean) = acceptMutex.withLock {
         val snapshot = state.value
-        val callId = snapshot.callId ?: return
-        if (!snapshot.incoming || snapshot.stage != CallStage.RINGING || incomingAccepted) return
+        val callId = snapshot.callId ?: return@withLock
+        if (!snapshot.incoming || snapshot.stage != CallStage.RINGING || incomingAccepted) {
+            return@withLock
+        }
         incomingAccepted = true
+        transition(CallEvent.Negotiating(callId))
+        armNegotiationTimeout(callId)
         CallForegroundService.enableMicrophone(context)
-        runCatching { signaling.connect() }
-            .onFailure {
-                incomingAccepted = false
-                transition(CallEvent.Failed(callId, "Unable to reach the call server"))
-                return
+        try {
+            signaling.connect()
+            signaling.accept(callId)
+        } catch (_: TimeoutCancellationException) {
+            incomingAccepted = false
+            cancelNegotiationTimeout()
+            transition(CallEvent.AcceptFailed(callId, "Call server timed out. Tap Accept again."))
+            return@withLock
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            incomingAccepted = false
+            cancelNegotiationTimeout()
+            if (error.message?.contains("no longer available", ignoreCase = true) == true) {
+                finishCall(
+                    "Caller is no longer available",
+                    notifyRemote = false,
+                    notifyTelecom = true,
+                    addToHistory = false
+                )
+            } else {
+                transition(CallEvent.AcceptFailed(callId, "Could not accept. Tap Accept again."))
             }
-        signaling.accept(callId)
-        if (!fromTelecom && telecom.registered.value) telecom.answer()
+            return@withLock
+        }
+        if (state.value.callId != callId || state.value.stage != CallStage.NEGOTIATING) {
+            return@withLock
+        }
+        if (!fromTelecom) answerTelecomWhenRegistered(callId)
         pendingOffer?.let { offer ->
             pendingOffer = null
-            answerOffer(callId, snapshot.peerId.orEmpty(), offer)
+            answerOffer(callId, snapshot.peerId.orEmpty(), offer.sdp, offer.negotiationId)
         }
     }
 
     override fun declineIncoming() {
         val snapshot = state.value
         val callId = snapshot.callId ?: return
-        signaling.decline(callId)
+        scope.launch {
+            runCatching {
+                withTimeout(END_SIGNAL_TIMEOUT_MS) { signaling.decline(callId) }
+            }
+        }
         telecom.disconnect(DisconnectCause.REJECTED)
         finishCall("Call declined", notifyRemote = false, notifyTelecom = false, addToHistory = false)
     }
@@ -251,12 +375,21 @@ class DefaultCallCoordinator @Inject constructor(
     override fun reconnect() {
         val snapshot = state.value
         val callId = snapshot.callId ?: return
-        if (callId.startsWith("pending-")) {
+        if (callId.startsWith("pending-") || restoredUnacceptedOutgoing) {
             val peerId = snapshot.peerId ?: return
             scope.launch {
-                // The invite never reached the server, so retry with a new logical
-                // call instead of attempting ICE against a provisional identifier.
-                signaling.disconnect()
+                // An unaccepted outgoing ring cannot use call.reconnect because the
+                // backend has not moved it to connected. End it and send a fresh invite.
+                if (!callId.startsWith("pending-")) {
+                    runCatching {
+                        withTimeout(END_SIGNAL_TIMEOUT_MS) {
+                            signaling.end(callId, peerId, "unknown")
+                        }
+                    }
+                } else {
+                    signaling.disconnect()
+                }
+                restoredUnacceptedOutgoing = false
                 sessionStore.clear()
                 machine.dispatch(CallEvent.Reset)
                 notifications.cancel()
@@ -268,8 +401,11 @@ class DefaultCallCoordinator @Inject constructor(
             if (!telecom.registered.value) {
                 startCallInfrastructure(callId, snapshot.peerName, snapshot.incoming)
             }
-            transition(CallEvent.NetworkLost(callId))
-            attemptIceRestart(callId, snapshot.peerId.orEmpty())
+            if (snapshot.stage == CallStage.VOIP_DISCONNECTED) {
+                resetNegotiation(closeRtc = true)
+            }
+            transition(CallEvent.RetryStarted(callId))
+            recoverMedia(callId, snapshot.peerId.orEmpty())
         }
     }
 
@@ -313,14 +449,31 @@ class DefaultCallCoordinator @Inject constructor(
         val snapshot = state.value
         val callId = snapshot.callId ?: return
         val peerId = snapshot.peerId ?: return
-        signaling.sendIceCandidate(callId, peerId, candidate)
+        val negotiationId = localCandidateNegotiationId ?: return
+        synchronized(pendingLocalCandidates) {
+            if (!localDescriptionAnnounced) {
+                pendingLocalCandidates += candidate
+                return
+            }
+        }
+        scope.launch {
+            runCatching {
+                signaling.sendIceCandidate(callId, peerId, candidate, negotiationId)
+            }
+        }
     }
 
     override fun onConnectionStateChanged(state: RtcConnectionState) {
+        rtcConnectionState = state
         val snapshot = this.state.value
         val callId = snapshot.callId ?: return
         when (state) {
             RtcConnectionState.CONNECTED -> scope.launch {
+                iceDisconnectJob?.cancel()
+                iceDisconnectJob = null
+                cancelNegotiationTimeout()
+                localOfferCallId = null
+                reconnectRequestedCallId = null
                 when (snapshot.stage) {
                     CallStage.RECONNECTING -> transition(CallEvent.IceRestartSucceeded(callId))
                     CallStage.RESTORING_VOIP -> {
@@ -333,17 +486,25 @@ class DefaultCallCoordinator @Inject constructor(
                 if (telecom.registered.value && !snapshot.incoming) telecom.activate()
             }
             RtcConnectionState.FAILED -> scope.launch {
+                iceDisconnectJob?.cancel()
+                iceDisconnectJob = null
+                resetNegotiation(closeRtc = false)
                 transition(CallEvent.NetworkLost(callId))
-                attemptIceRestart(callId, snapshot.peerId.orEmpty())
+                recoverMedia(callId, snapshot.peerId.orEmpty())
             }
-            RtcConnectionState.DISCONNECTED -> scope.launch {
+            RtcConnectionState.DISCONNECTED -> {
+                iceDisconnectJob?.cancel()
+                iceDisconnectJob = scope.launch {
                 // ICE "disconnected" is often transient; give it a short grace period.
-                delay(3_000)
+                delay(ICE_DISCONNECT_GRACE_MS)
                 if (this@DefaultCallCoordinator.state.value.callId == callId &&
-                    this@DefaultCallCoordinator.state.value.canTalk
+                    this@DefaultCallCoordinator.state.value.canTalk &&
+                    rtcConnectionState == RtcConnectionState.DISCONNECTED
                 ) {
+                    resetNegotiation(closeRtc = false)
                     transition(CallEvent.NetworkLost(callId))
-                    attemptIceRestart(callId, snapshot.peerId.orEmpty())
+                    recoverMedia(callId, snapshot.peerId.orEmpty())
+                }
                 }
             }
             else -> Unit
@@ -357,11 +518,21 @@ class DefaultCallCoordinator @Inject constructor(
             SignalingEvent.Connected -> {
                 val snapshot = state.value
                 if (snapshot.stage == CallStage.RECONNECTING) {
-                    snapshot.callId?.let { attemptIceRestart(it, snapshot.peerId.orEmpty()) }
+                    snapshot.callId?.let { recoverMedia(it, snapshot.peerId.orEmpty()) }
                 }
             }
             is SignalingEvent.Disconnected -> if (event.recoverable) {
-                state.value.callId?.let { transition(CallEvent.NetworkLost(it)) }
+                val snapshot = state.value
+                val callId = snapshot.callId
+                if (callId != null && (snapshot.stage == CallStage.NEGOTIATING ||
+                        localOfferCallId == callId)
+                ) {
+                    resetNegotiation(closeRtc = true)
+                    transition(CallEvent.NetworkLost(callId))
+                } else if (callId != null && snapshot.stage == CallStage.RECONNECTING) {
+                    resetNegotiation(closeRtc = false)
+                    transition(CallEvent.NetworkLost(callId))
+                }
             }
             is SignalingEvent.Incoming -> prepareIncoming(
                 event.callId,
@@ -370,30 +541,79 @@ class DefaultCallCoordinator @Inject constructor(
                 event.startedAt
             )
             is SignalingEvent.Accepted -> {
-                // The offer has already been sent; wait for the remote answer.
+                val snapshot = state.value
+                if (event.callId == snapshot.callId && !snapshot.incoming &&
+                    initialOfferSentCallId != event.callId
+                ) {
+                    cancelRingTimeout()
+                    initialOfferSentCallId = event.callId
+                    transition(CallEvent.Negotiating(event.callId))
+                    armNegotiationTimeout(event.callId)
+                    createAndSendOffer(
+                        event.callId,
+                        snapshot.peerId.orEmpty(),
+                        iceRestart = false
+                    )
+                }
             }
             is SignalingEvent.Declined -> if (event.callId == state.value.callId) {
                 finishCall("Friend declined", false, true, true)
             }
             is SignalingEvent.Offer -> {
                 if (event.callId != state.value.callId) return
-                if (state.value.incoming && !incomingAccepted) pendingOffer = event.sdp
-                else answerOffer(event.callId, event.from, event.sdp)
+                if (state.value.incoming && !incomingAccepted) {
+                    pendingOffer = PendingRemoteOffer(event.sdp, event.negotiationId)
+                } else {
+                    answerOffer(event.callId, event.from, event.sdp, event.negotiationId)
+                }
             }
             is SignalingEvent.Answer -> if (event.callId == state.value.callId) {
-                runCatching { negotiationMutex.withLock { rtc.setRemoteAnswer(event.sdp) } }
-                    .onFailure {
-                        transition(CallEvent.Failed(event.callId, "Unable to secure call audio"))
+                val expectedNegotiationId = activeLocalNegotiationId
+                if (expectedNegotiationId == null ||
+                    (event.negotiationId != expectedNegotiationId &&
+                        !(event.negotiationId == null && activeLocalAllowsLegacySignals))
+                ) return
+                try {
+                    withTimeout(NEGOTIATION_STEP_TIMEOUT_MS) {
+                        negotiationMutex.withLock { rtc.setRemoteAnswer(event.sdp) }
                     }
+                } catch (_: TimeoutCancellationException) {
+                    failNegotiation(event.callId, "Call audio setup timed out. Tap Retry.")
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Throwable) {
+                    failNegotiation(event.callId, "Unable to secure call audio. Tap Retry.")
+                }
             }
             is SignalingEvent.IceCandidateReceived -> if (event.callId == state.value.callId) {
-                rtc.addRemoteIceCandidate(event.candidate)
+                val expectedNegotiationId = if (state.value.incoming) {
+                    activeRemoteNegotiationId
+                } else {
+                    activeLocalNegotiationId
+                }
+                if (expectedNegotiationId != null &&
+                    (event.negotiationId == expectedNegotiationId ||
+                        (event.negotiationId == null &&
+                            !state.value.incoming && activeLocalAllowsLegacySignals))
+                ) {
+                    rtc.addRemoteIceCandidate(event.candidate)
+                }
             }
             is SignalingEvent.ReconnectRequested -> if (event.callId == state.value.callId) {
-                // The remote peer follows with an ICE-restart offer.
+                val snapshot = state.value
+                if (!snapshot.incoming) {
+                    restartAsCaller(
+                        event.callId,
+                        snapshot.peerId.orEmpty(),
+                        notifyPeer = false
+                    )
+                }
             }
             is SignalingEvent.Ended -> if (event.callId == state.value.callId) {
                 finishCall(event.reason ?: "Friend ended the call", false, true, true)
+            }
+            is SignalingEvent.PeerUnavailable -> if (event.callId == state.value.callId) {
+                finishCall("Friend is offline", false, true, true)
             }
             is SignalingEvent.Error -> if (event.code == "CALL_NOT_FOUND") {
                 state.value.callId?.let { transition(CallEvent.Failed(it, event.message)) }
@@ -401,16 +621,35 @@ class DefaultCallCoordinator @Inject constructor(
         }
     }
 
-    private fun answerOffer(callId: String, peerId: String, offer: String) {
-        scope.launch {
-            runCatching {
+    private suspend fun answerOffer(
+        callId: String,
+        peerId: String,
+        offer: String,
+        offeredNegotiationId: String?
+    ) {
+        val negotiationId = offeredNegotiationId ?: UUID.randomUUID().toString()
+        try {
+            withTimeout(NEGOTIATION_STEP_TIMEOUT_MS) {
                 val answer = negotiationMutex.withLock {
-                    rtc.acceptOfferAndCreateAnswer(offer)
+                    if (state.value.callId != callId) return@withLock null
+                    activeRemoteNegotiationId = negotiationId
+                    activeLocalNegotiationId = null
+                    beginLocalDescription(negotiationId)
+                    rtc.acceptOfferAndCreateAnswer(offer).also {
+                        applyDesiredAudioState()
+                    }
                 }
-                signaling.sendAnswer(callId, peerId, answer)
-            }.onFailure {
-                transition(CallEvent.Failed(callId, "Could not negotiate call audio"))
+                if (answer == null) return@withTimeout
+                signaling.sendAnswer(callId, peerId, answer, negotiationId)
+                flushLocalCandidates(callId, peerId, negotiationId)
             }
+            armNegotiationTimeout(callId)
+        } catch (_: TimeoutCancellationException) {
+            failNegotiation(callId, "Call audio setup timed out. Tap Retry.")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            failNegotiation(callId, "Could not negotiate call audio. Tap Retry.")
         }
     }
 
@@ -424,7 +663,15 @@ class DefaultCallCoordinator @Inject constructor(
         val snapshot = state.value
         val callId = snapshot.callId ?: return
         when (status) {
-            NetworkStatus.Unavailable -> if (snapshot.hasLiveSession) {
+            NetworkStatus.Unavailable -> if (
+                snapshot.hasLiveSession &&
+                snapshot.stage !in setOf(CallStage.OUTGOING_VOIP_CALL, CallStage.RINGING)
+            ) {
+                if (snapshot.stage == CallStage.NEGOTIATING) {
+                    resetNegotiation(closeRtc = true)
+                } else {
+                    resetNegotiation(closeRtc = false)
+                }
                 transition(CallEvent.NetworkLost(callId))
             }
             is NetworkStatus.Available -> {
@@ -432,8 +679,7 @@ class DefaultCallCoordinator @Inject constructor(
                 val transportChanged = previous is NetworkStatus.Available &&
                     previous.type != status.type
                 if (snapshot.stage == CallStage.RECONNECTING || transportChanged) {
-                    runCatching { signaling.connect() }
-                    attemptIceRestart(callId, snapshot.peerId.orEmpty())
+                    recoverMedia(callId, snapshot.peerId.orEmpty())
                 }
             }
         }
@@ -490,16 +736,216 @@ class DefaultCallCoordinator @Inject constructor(
         customerDisplayName = "Customer"
     }
 
-    private suspend fun attemptIceRestart(callId: String, peerId: String) {
+    private suspend fun createAndSendOffer(
+        callId: String,
+        peerId: String,
+        iceRestart: Boolean
+    ) {
         if (peerId.isBlank()) return
-        runCatching {
-            signaling.connect()
-            signaling.requestReconnect(callId, peerId)
-            val offer = negotiationMutex.withLock { rtc.createOffer(iceRestart = true) }
-            signaling.sendOffer(callId, peerId, offer)
-        }.onFailure {
-            transition(CallEvent.Failed(callId, "Unable to reconnect. Tap Retry."))
+        val negotiationId = UUID.randomUUID().toString()
+        var announced = false
+        try {
+            withTimeout(NEGOTIATION_STEP_TIMEOUT_MS) {
+                val offer = negotiationMutex.withLock {
+                    if (state.value.callId != callId || localOfferCallId == callId) {
+                        return@withLock null
+                    }
+                    localOfferCallId = callId
+                    activeLocalNegotiationId = negotiationId
+                    activeLocalAllowsLegacySignals = !iceRestart
+                    activeRemoteNegotiationId = null
+                    beginLocalDescription(negotiationId)
+                    val createdOffer = rtc.createOffer(iceRestart)
+                    applyDesiredAudioState()
+                    if (state.value.callId != callId) {
+                        clearNegotiationStateLocked(closeRtc = true)
+                        return@withLock null
+                    }
+                    createdOffer
+                }
+                if (offer == null) return@withTimeout
+                signaling.sendOffer(callId, peerId, offer, negotiationId)
+                flushLocalCandidates(callId, peerId, negotiationId)
+                announced = true
+            }
+            if (announced) armNegotiationTimeout(callId)
+        } catch (_: TimeoutCancellationException) {
+            failNegotiation(
+                callId,
+                if (iceRestart) "Reconnection timed out. Tap Retry."
+                else "Call audio setup timed out. Tap Retry."
+            )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            val reason = if (iceRestart) {
+                "Unable to reconnect. Tap Retry."
+            } else {
+                "Could not start secure call audio. Tap Retry."
+            }
+            failNegotiation(callId, reason)
         }
+    }
+
+    private fun beginLocalDescription(negotiationId: String) {
+        synchronized(pendingLocalCandidates) {
+            localCandidateNegotiationId = negotiationId
+            localDescriptionAnnounced = false
+            pendingLocalCandidates.clear()
+        }
+    }
+
+    private suspend fun flushLocalCandidates(
+        callId: String,
+        peerId: String,
+        negotiationId: String
+    ) {
+        val candidates = synchronized(pendingLocalCandidates) {
+            localDescriptionAnnounced = true
+            pendingLocalCandidates.toList().also { pendingLocalCandidates.clear() }
+        }
+        candidates.forEach {
+            signaling.sendIceCandidate(callId, peerId, it, negotiationId)
+        }
+    }
+
+    private suspend fun restartAsCaller(
+        callId: String,
+        peerId: String,
+        notifyPeer: Boolean
+    ) {
+        if (peerId.isBlank()) return
+        try {
+            recoveryMutex.withLock {
+                if (state.value.callId != callId || localOfferCallId == callId) return@withLock
+                signaling.connect()
+                if (notifyPeer) signaling.requestReconnect(callId, peerId)
+                createAndSendOffer(callId, peerId, iceRestart = true)
+            }
+        } catch (_: TimeoutCancellationException) {
+            failNegotiation(callId, "Reconnection timed out. Tap Retry.")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            failNegotiation(callId, "Unable to reconnect. Tap Retry.")
+        }
+    }
+
+    private suspend fun recoverMedia(callId: String, peerId: String) {
+        if (peerId.isBlank()) return
+        val snapshot = state.value
+        if (!snapshot.incoming) {
+            restartAsCaller(callId, peerId, notifyPeer = true)
+            return
+        }
+        try {
+            recoveryMutex.withLock {
+                if (state.value.callId != callId) return@withLock
+                if (reconnectRequestedCallId == callId ||
+                    (state.value.stage == CallStage.RECONNECTING &&
+                        activeRemoteNegotiationId != null)
+                ) return@withLock
+                reconnectRequestedCallId = callId
+                signaling.connect()
+                // Only the original caller creates restart offers. This avoids
+                // simultaneous-offer glare and stale answers on both phones.
+                signaling.requestReconnect(callId, peerId)
+            }
+            armNegotiationTimeout(callId)
+        } catch (_: TimeoutCancellationException) {
+            failNegotiation(callId, "Reconnection timed out. Tap Retry.")
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            failNegotiation(callId, "Unable to reconnect. Tap Retry.")
+        }
+    }
+
+    private fun applyDesiredAudioState() {
+        val snapshot = state.value
+        rtc.setMicrophoneEnabled(!snapshot.muted && !snapshot.heldForCellularCall)
+        rtc.setRemoteAudioEnabled(!snapshot.heldForCellularCall)
+    }
+
+    private fun armRingTimeout(callId: String) {
+        cancelRingTimeout()
+        ringTimeoutJob = scope.launch {
+            delay(OUTGOING_RING_TIMEOUT_MS)
+            val snapshot = state.value
+            if (snapshot.callId == callId && !snapshot.incoming &&
+                snapshot.stage == CallStage.RINGING
+            ) {
+                finishCall(
+                    reason = "No answer",
+                    notifyRemote = true,
+                    notifyTelecom = true,
+                    addToHistory = true
+                )
+            }
+        }
+    }
+
+    private fun cancelRingTimeout() {
+        ringTimeoutJob?.cancel()
+        ringTimeoutJob = null
+    }
+
+    private fun armNegotiationTimeout(callId: String) {
+        val stage = state.value.takeIf { it.callId == callId }?.stage ?: return
+        if (stage !in setOf(
+                CallStage.NEGOTIATING,
+                CallStage.RECONNECTING,
+                CallStage.RESTORING_VOIP
+            )
+        ) return
+        negotiationTimeoutJob?.cancel()
+        negotiationTimeoutJob = scope.launch {
+            delay(NEGOTIATION_TIMEOUT_MS)
+            val snapshot = state.value
+            if (snapshot.callId == callId && snapshot.stage in setOf(
+                    CallStage.NEGOTIATING,
+                    CallStage.RECONNECTING,
+                    CallStage.RESTORING_VOIP
+                )
+            ) {
+                negotiationTimeoutJob = null
+                resetNegotiation(closeRtc = true, cancelTimeout = false)
+                transition(CallEvent.Failed(callId, "Call audio timed out. Tap Retry."))
+            }
+        }
+    }
+
+    private fun cancelNegotiationTimeout() {
+        negotiationTimeoutJob?.cancel()
+        negotiationTimeoutJob = null
+    }
+
+    private suspend fun failNegotiation(callId: String, reason: String) {
+        if (state.value.callId != callId) return
+        resetNegotiation(closeRtc = true)
+        transition(CallEvent.Failed(callId, reason))
+    }
+
+    private suspend fun resetNegotiation(
+        closeRtc: Boolean,
+        cancelTimeout: Boolean = true
+    ) {
+        if (cancelTimeout) cancelNegotiationTimeout()
+        negotiationMutex.withLock { clearNegotiationStateLocked(closeRtc) }
+    }
+
+    private fun clearNegotiationStateLocked(closeRtc: Boolean) {
+        localOfferCallId = null
+        activeLocalNegotiationId = null
+        activeLocalAllowsLegacySignals = false
+        activeRemoteNegotiationId = null
+        reconnectRequestedCallId = null
+        synchronized(pendingLocalCandidates) {
+            pendingLocalCandidates.clear()
+            localDescriptionAnnounced = true
+            localCandidateNegotiationId = null
+        }
+        if (closeRtc) rtc.close()
     }
 
     private suspend fun restoreVoipAfterTelecomActivation() {
@@ -507,7 +953,7 @@ class DefaultCallCoordinator @Inject constructor(
         val callId = snapshot.callId ?: return
         rtc.setRemoteAudioEnabled(true)
         rtc.setMicrophoneEnabled(!snapshot.mutedBeforeCellularCall)
-        attemptIceRestart(callId, snapshot.peerId.orEmpty())
+        recoverMedia(callId, snapshot.peerId.orEmpty())
         if (state.value.stage == CallStage.RESTORING_VOIP) {
             transition(CallEvent.VoipRestored(callId))
             delay(1_500)
@@ -551,6 +997,18 @@ class DefaultCallCoordinator @Inject constructor(
         }
     }
 
+    private fun answerTelecomWhenRegistered(callId: String) {
+        if (!telecom.isSupported) return
+        telecomAnswerWaiter?.cancel()
+        telecomAnswerWaiter = scope.launch {
+            telecom.registered.filter { it }.first()
+            val snapshot = state.value
+            if (incomingAccepted && snapshot.callId == callId && snapshot.incoming) {
+                telecom.answer()
+            }
+        }
+    }
+
     private fun finishCall(
         reason: String,
         notifyRemote: Boolean,
@@ -562,14 +1020,21 @@ class DefaultCallCoordinator @Inject constructor(
             val snapshot = state.value
             val callId = snapshot.callId
             val peerId = snapshot.peerId
+            cancelRingTimeout()
+            iceDisconnectJob?.cancel()
+            iceDisconnectJob = null
+            if (callId != null) transition(CallEvent.Ended(callId, reason))
+            if (notifyTelecom) telecom.disconnect()
+            resetNegotiation(closeRtc = true)
             if (notifyRemote && callId != null && peerId != null) {
                 val quality = snapshot.quality.takeUnless { it == CallQuality.NO_INTERNET }
                     ?.name?.lowercase() ?: "unknown"
-                signaling.end(callId, peerId, quality)
+                runCatching {
+                    withTimeout(END_SIGNAL_TIMEOUT_MS) {
+                        signaling.end(callId, peerId, quality)
+                    }
+                }
             }
-            if (notifyTelecom) telecom.disconnect()
-            rtc.close()
-            if (callId != null) transition(CallEvent.Ended(callId, reason))
             if (addToHistory && callId != null && snapshot.startedAtEpochMs != null) {
                 val endedAt = System.currentTimeMillis()
                 historyRepository.addRecord(
@@ -590,7 +1055,9 @@ class DefaultCallCoordinator @Inject constructor(
             sessionStore.clear()
             pendingOffer = null
             incomingAccepted = false
-            if (presenceUserId != null) CallAvailabilityService.start(context)
+            initialOfferSentCallId = null
+            telecomAnswerWaiter?.cancel()
+            telecomAnswerWaiter = null
             delay(1_000)
             machine.dispatch(CallEvent.Reset)
             notifications.cancel()
@@ -600,14 +1067,9 @@ class DefaultCallCoordinator @Inject constructor(
 
     private suspend fun transition(event: CallEvent): CallState {
         val next = machine.dispatch(event)
-        if (next.hasLiveSession) {
+        if (next.shouldShowCallUi && next.stage != CallStage.CALL_ENDED) {
             sessionStore.save(next)
-        } else if (next.stage in setOf(
-                CallStage.IDLE,
-                CallStage.VOIP_DISCONNECTED,
-                CallStage.CALL_ENDED
-            )
-        ) {
+        } else if (next.stage in setOf(CallStage.IDLE, CallStage.CALL_ENDED)) {
             sessionStore.clear()
         }
         notifications.show(next)
@@ -615,7 +1077,23 @@ class DefaultCallCoordinator @Inject constructor(
     }
 
     private fun Throwable.userFacingMessage(): String = when (this) {
-        is kotlinx.coroutines.TimeoutCancellationException -> "Call server timed out"
+        is TimeoutCancellationException -> "Call server timed out"
         else -> message?.takeIf { it.length <= 120 } ?: "Unable to start the call"
     }
+
+    private companion object {
+        const val END_SIGNAL_TIMEOUT_MS = 5_000L
+        const val ICE_DISCONNECT_GRACE_MS = 3_000L
+        const val NEGOTIATION_STEP_TIMEOUT_MS = 20_000L
+        const val NEGOTIATION_TIMEOUT_MS = 30_000L
+        const val OUTGOING_RING_TIMEOUT_MS = 45_000L
+    }
 }
+
+/**
+ * The availability service may establish the socket from its persisted token
+ * before the repository restores the matching user. That initial null -> user
+ * transition must keep the socket; logout and real account changes must close it.
+ */
+internal fun shouldDisconnectPresence(previousUserId: String?, nextUserId: String?): Boolean =
+    previousUserId != null && previousUserId != nextUserId

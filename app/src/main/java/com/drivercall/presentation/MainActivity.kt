@@ -10,9 +10,11 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import com.drivercall.data.preferences.UserPreferences
+import com.drivercall.data.security.TokenStorage
 import com.drivercall.presentation.navigation.DriverCallNavGraph
 import com.drivercall.presentation.permissions.CallPermissionGate
 import com.drivercall.presentation.theme.DriverCallTheme
+import com.drivercall.service.CallAvailabilityService
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
 
@@ -21,6 +23,14 @@ class MainActivity : ComponentActivity() {
 
     @Inject
     lateinit var userPreferences: UserPreferences
+
+    @Inject
+    lateinit var tokenStorage: TokenStorage
+
+    override fun onStart() {
+        super.onStart()
+        if (tokenStorage.getToken() != null) CallAvailabilityService.start(this)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)

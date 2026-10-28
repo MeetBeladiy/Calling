@@ -24,6 +24,7 @@ import org.webrtc.SessionDescription
 import org.webrtc.audio.JavaAudioDeviceModule
 import javax.inject.Inject
 import javax.inject.Singleton
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.math.roundToInt
@@ -72,6 +73,7 @@ class AndroidWebRtcEngine @Inject constructor(
     private var remoteAudioTrack: AudioTrack? = null
     private val pendingRemoteCandidates = mutableListOf<RtcIceCandidate>()
     private val connectionMutex = Mutex()
+    private val connectionGeneration = AtomicLong(0)
 
     private val factory: PeerConnectionFactory by lazy {
         PeerConnectionFactory.initialize(
@@ -133,7 +135,10 @@ class AndroidWebRtcEngine @Inject constructor(
             rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
             keyType = PeerConnection.KeyType.ECDSA
         }
-        val connection = requireNotNull(factory.createPeerConnection(configuration, observer)) {
+        val generation = connectionGeneration.incrementAndGet()
+        val connection = requireNotNull(
+            factory.createPeerConnection(configuration, observer(generation))
+        ) {
             "WebRTC could not create a peer connection"
         }
 
@@ -196,6 +201,15 @@ class AndroidWebRtcEngine @Inject constructor(
 
     override suspend fun setRemoteAnswer(remoteSdp: String) {
         val connection = ensurePeerConnection()
+        // Duplicate/stale answers can be delivered after reconnecting sockets.
+        // Once the local offer has already been answered, applying another answer
+        // in STABLE state is invalid SDP and must be treated as an idempotent no-op.
+        if (connection.signalingState() == PeerConnection.SignalingState.STABLE &&
+            connection.remoteDescription?.type == SessionDescription.Type.ANSWER
+        ) return
+        check(connection.signalingState() == PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
+            "Ignoring an answer without a matching local offer"
+        }
         connection.setDescription(
             SessionDescription(SessionDescription.Type.ANSWER, remoteSdp),
             local = false
@@ -279,6 +293,9 @@ class AndroidWebRtcEngine @Inject constructor(
     }
 
     override fun close() {
+        // Invalidate callbacks before closing. libwebrtc can deliver queued ICE
+        // events after dispose; they must not mutate the next PeerConnection.
+        connectionGeneration.incrementAndGet()
         localAudioTrack?.dispose()
         audioSource?.dispose()
         peerConnection?.close()
@@ -335,9 +352,10 @@ class AndroidWebRtcEngine @Inject constructor(
         else setRemoteDescription(callback, description)
     }
 
-    private val observer = object : PeerConnection.Observer {
+    private fun observer(generation: Long) = object : PeerConnection.Observer {
         override fun onSignalingChange(state: PeerConnection.SignalingState) = Unit
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
+            if (generation != connectionGeneration.get()) return
             val mapped = when (state) {
                 PeerConnection.IceConnectionState.NEW -> RtcConnectionState.NEW
                 PeerConnection.IceConnectionState.CHECKING -> RtcConnectionState.CONNECTING
@@ -352,6 +370,7 @@ class AndroidWebRtcEngine @Inject constructor(
         override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
         override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) = Unit
         override fun onIceCandidate(candidate: IceCandidate) {
+            if (generation != connectionGeneration.get()) return
             listener?.onLocalIceCandidate(
                 RtcIceCandidate(candidate.sdpMid, candidate.sdpMLineIndex, candidate.sdp)
             )
@@ -361,9 +380,11 @@ class AndroidWebRtcEngine @Inject constructor(
         override fun onRemoveStream(stream: MediaStream) = Unit
         override fun onDataChannel(channel: DataChannel) = Unit
         override fun onRenegotiationNeeded() {
+            if (generation != connectionGeneration.get()) return
             listener?.onRenegotiationNeeded()
         }
         override fun onAddTrack(receiver: RtpReceiver, mediaStreams: Array<out MediaStream>) {
+            if (generation != connectionGeneration.get()) return
             (receiver.track() as? AudioTrack)?.let {
                 remoteAudioTrack = it
                 it.setEnabled(true)

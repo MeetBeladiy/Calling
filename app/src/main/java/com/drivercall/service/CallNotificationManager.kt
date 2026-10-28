@@ -97,7 +97,7 @@ class CallNotificationManager @Inject constructor(
     }
 
     private fun serviceAction(action: String, requestCode: Int): PendingIntent =
-        PendingIntent.getService(
+        PendingIntent.getForegroundService(
             context,
             requestCode,
             Intent(context, CallForegroundService::class.java).setAction(action),

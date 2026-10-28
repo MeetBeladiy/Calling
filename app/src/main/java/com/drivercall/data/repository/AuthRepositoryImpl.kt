@@ -52,8 +52,12 @@ class AuthRepositoryImpl @Inject constructor(
         return try {
             val userDto = userApi.getMe().user
             userDao.upsert(userDto.toEntity())
-            sessionState.value = AuthSession(userDto.toDomain(), token)
-            CallAvailabilityService.start(context)
+            // The OkHttp authenticator may have rotated the access token while
+            // getMe() retried. Always publish the newest stored credential.
+            sessionState.value = AuthSession(
+                userDto.toDomain(),
+                tokenStorage.getToken() ?: token
+            )
             true
         } catch (e: HttpException) {
             if (e.code() == 401) logout()
@@ -64,7 +68,6 @@ class AuthRepositoryImpl @Inject constructor(
             val cached = userDao.getUser()
             if (cached != null) {
                 sessionState.value = AuthSession(cached.toDomain(), token)
-                CallAvailabilityService.start(context)
                 true
             } else {
                 false
@@ -161,7 +164,7 @@ class AuthRepositoryImpl @Inject constructor(
         is UnknownHostException ->
             "The Calling App server address could not be found. Check the app's server configuration."
         is ConnectException ->
-            "Cannot reach the Calling App server. Make sure it is running and your device is on the same network."
+            "Cannot reach the Calling App service. Check your internet connection and try again."
         is SocketTimeoutException ->
             "The Calling App server took too long to respond. Please try again."
         else ->

@@ -21,9 +21,9 @@ const clientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("ping"), requestId: z.string().max(100).optional() }),
   z.object({ type: z.literal("presence"), requestId: z.string().max(100).optional() }),
   z.object({ type: z.literal("call.invite"), to: z.string().uuid(), requestId: z.string().max(100).optional() }),
-  z.object({ type: z.literal("call.offer"), callId: z.string().uuid(), to: z.string().uuid(), sdp: z.string().min(1).max(131_072), requestId: z.string().max(100).optional() }),
-  z.object({ type: z.literal("call.answer"), callId: z.string().uuid(), to: z.string().uuid(), sdp: z.string().min(1).max(131_072), requestId: z.string().max(100).optional() }),
-  z.object({ type: z.literal("ice.candidate"), callId: z.string().uuid(), to: z.string().uuid(), candidate: candidateSchema, requestId: z.string().max(100).optional() }),
+  z.object({ type: z.literal("call.offer"), callId: z.string().uuid(), to: z.string().uuid(), sdp: z.string().min(1).max(131_072), negotiationId: z.string().uuid().optional(), requestId: z.string().max(100).optional() }),
+  z.object({ type: z.literal("call.answer"), callId: z.string().uuid(), to: z.string().uuid(), sdp: z.string().min(1).max(131_072), negotiationId: z.string().uuid().optional(), requestId: z.string().max(100).optional() }),
+  z.object({ type: z.literal("ice.candidate"), callId: z.string().uuid(), to: z.string().uuid(), candidate: candidateSchema, negotiationId: z.string().uuid().optional(), requestId: z.string().max(100).optional() }),
   z.object({ type: z.literal("call.accept"), callId: z.string().uuid(), requestId: z.string().max(100).optional() }),
   z.object({ type: z.literal("call.decline"), callId: z.string().uuid(), requestId: z.string().max(100).optional() }),
   z.object({ type: z.literal("call.reconnect"), callId: z.string().uuid(), to: z.string().uuid(), requestId: z.string().max(100).optional() }),
@@ -31,12 +31,25 @@ const clientMessageSchema = z.discriminatedUnion("type", [
 ]);
 
 type ClientMessage = z.infer<typeof clientMessageSchema>;
-type Client = WebSocket & { userId: string; alive: boolean; windowStartedAt: number; messagesInWindow: number };
+type Client = WebSocket & {
+  userId: string;
+  alive: boolean;
+  windowStartedAt: number;
+  messagesInWindow: number;
+  messageQueue: Promise<void>;
+};
+
+type DisconnectCleanup = {
+  cancelled: boolean;
+  timer: NodeJS.Timeout;
+};
 
 export class SignalingHub implements PresenceReader {
   private readonly wss = new WebSocketServer({ noServer: true, maxPayload: 150_000 });
   private readonly clients = new Map<string, Set<Client>>();
+  private readonly disconnectCleanups = new Map<string, DisconnectCleanup>();
   private heartbeat?: NodeJS.Timeout;
+  private closing = false;
 
   constructor(private readonly store: Store, private readonly tokens: TokenService, private readonly calls: CallService) {
     this.wss.on("connection", (socket: Client) => this.onConnection(socket));
@@ -70,6 +83,7 @@ export class SignalingHub implements PresenceReader {
         client.alive = true;
         client.windowStartedAt = Date.now();
         client.messagesInWindow = 0;
+        client.messageQueue = Promise.resolve();
         this.wss.emit("connection", client, request);
       });
     } catch {
@@ -79,12 +93,24 @@ export class SignalingHub implements PresenceReader {
   }
 
   close(): void {
+    this.closing = true;
     if (this.heartbeat) clearInterval(this.heartbeat);
+    for (const cleanup of this.disconnectCleanups.values()) {
+      cleanup.cancelled = true;
+      clearTimeout(cleanup.timer);
+    }
+    this.disconnectCleanups.clear();
     for (const sockets of this.clients.values()) for (const socket of sockets) socket.close(1001, "Server shutting down");
     this.wss.close();
   }
 
   private onConnection(socket: Client): void {
+    const pendingCleanup = this.disconnectCleanups.get(socket.userId);
+    if (pendingCleanup) {
+      pendingCleanup.cancelled = true;
+      clearTimeout(pendingCleanup.timer);
+      this.disconnectCleanups.delete(socket.userId);
+    }
     const wasOnline = this.isOnline(socket.userId);
     const sockets = this.clients.get(socket.userId) ?? new Set<Client>();
     sockets.add(socket);
@@ -94,12 +120,28 @@ export class SignalingHub implements PresenceReader {
 
     socket.on("pong", () => { socket.alive = true; });
     socket.on("message", (raw, isBinary) => {
-      if (isBinary) return this.sendError(socket, "UNSUPPORTED_MESSAGE", "Binary messages are not supported");
-      void this.onMessage(socket, raw.toString()).catch((error: unknown) => {
+      const text = raw.toString();
+      // Apply the cheap receipt-time limit before adding work to the asynchronous
+      // queue. Otherwise a slow store operation lets an attacker enqueue an
+      // unbounded number of frames before enforceMessageLimit ever executes.
+      try {
+        this.enforceMessageLimit(socket);
+      } catch (error: unknown) {
         const message = error instanceof Error ? error.message : "Message failed";
         const code = error instanceof HttpError ? error.code : "SIGNALING_ERROR";
-        this.sendError(socket, code, message);
-      });
+        this.sendError(socket, code, message, this.readRequestId(text));
+        return;
+      }
+      if (isBinary) return this.sendError(socket, "UNSUPPORTED_MESSAGE", "Binary messages are not supported");
+      // A client WebSocket is an ordered stream. Preserve that ordering across
+      // asynchronous store operations so an offer cannot be overtaken by ICE.
+      socket.messageQueue = socket.messageQueue
+        .then(() => this.onMessage(socket, text))
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : "Message failed";
+          const code = error instanceof HttpError ? error.code : "SIGNALING_ERROR";
+          this.sendError(socket, code, message, this.readRequestId(text));
+        });
     });
     socket.on("close", () => {
       const userSockets = this.clients.get(socket.userId);
@@ -107,6 +149,7 @@ export class SignalingHub implements PresenceReader {
       if (!userSockets?.size) {
         this.clients.delete(socket.userId);
         void this.broadcastPresence(socket.userId, false);
+        if (!this.closing) this.scheduleDisconnectedCallCleanup(socket.userId);
       }
     });
   }
@@ -125,7 +168,6 @@ export class SignalingHub implements PresenceReader {
   }
 
   private async onMessage(socket: Client, raw: string): Promise<void> {
-    this.enforceMessageLimit(socket);
     let decoded: unknown;
     try { decoded = JSON.parse(raw); } catch { throw new HttpError(400, "Message must be valid JSON", "INVALID_JSON"); }
     const message = clientMessageSchema.parse(decoded);
@@ -139,25 +181,56 @@ export class SignalingHub implements PresenceReader {
         return;
       case "call.invite": {
         const call = await this.calls.startVoip(socket.userId, message.to);
-        this.send(socket, { type: "call.created", callId: call.id, to: message.to, requestId: message.requestId });
         const delivered = this.sendTo(message.to, {
           type: "call.incoming",
           callId: call.id,
           from: socket.userId,
           startedAt: new Date(call.startedAt).getTime()
         });
+        if (!delivered) await this.calls.end(call.id, socket.userId, "failed");
+        this.send(socket, {
+          type: "call.created",
+          callId: call.id,
+          to: message.to,
+          requestId: message.requestId,
+          delivered
+        });
         if (!delivered) this.send(socket, { type: "peer.unavailable", callId: call.id, userId: message.to });
         return;
       }
       case "call.accept": {
         const call = await this.calls.answer(message.callId, socket.userId);
-        this.sendTo(call.callerId, { type: "call.accept", callId: call.id, from: socket.userId, answeredAt: call.answeredAt });
-        this.send(socket, { type: "ack", action: message.type, callId: call.id, requestId: message.requestId });
+        const delivered = this.sendTo(call.callerId, {
+          type: "call.accept",
+          callId: call.id,
+          from: socket.userId,
+          answeredAt: call.answeredAt
+        });
+        if (!delivered) {
+          await this.calls.failUndeliveredAnswer(call.id, socket.userId);
+        }
+        this.send(socket, {
+          type: "ack",
+          action: message.type,
+          callId: call.id,
+          requestId: message.requestId,
+          delivered
+        });
         return;
       }
       case "call.decline": {
         const call = await this.calls.getParticipantCall(message.callId, socket.userId);
-        if (call.receiverId !== socket.userId || call.status !== "ringing") throw new HttpError(409, "Call is no longer ringing", "CALL_NOT_RINGING");
+        if (call.receiverId !== socket.userId) {
+          throw new HttpError(403, "Only the receiver can decline this call", "INVALID_CALL_PARTICIPANT");
+        }
+        // A failed accept delivery already terminates the server-side call. Let
+        // the receiver's subsequent Decline action clean up its local ringing UI
+        // without turning that harmless retry into another protocol error.
+        if (["declined", "missed", "ended", "failed"].includes(call.status)) {
+          this.send(socket, { type: "ack", action: message.type, callId: call.id, requestId: message.requestId });
+          return;
+        }
+        if (call.status !== "ringing") throw new HttpError(409, "Call is no longer ringing", "CALL_NOT_RINGING");
         await this.calls.end(call.id, socket.userId, "declined");
         this.sendTo(call.callerId, { type: "call.decline", callId: call.id, from: socket.userId });
         this.send(socket, { type: "ack", action: message.type, callId: call.id, requestId: message.requestId });
@@ -205,6 +278,42 @@ export class SignalingHub implements PresenceReader {
     for (const peer of peers) this.sendTo(peer, { type: "presence", userId, online, at: new Date().toISOString() });
   }
 
+  private scheduleDisconnectedCallCleanup(userId: string): void {
+    const previous = this.disconnectCleanups.get(userId);
+    if (previous) {
+      previous.cancelled = true;
+      clearTimeout(previous.timer);
+    }
+    const cleanup = { cancelled: false } as DisconnectCleanup;
+    cleanup.timer = setTimeout(() => {
+      void this.calls.failActiveCallsForUser(
+        userId,
+        () => !cleanup.cancelled &&
+          this.disconnectCleanups.get(userId) === cleanup &&
+          !this.isOnline(userId)
+      ).then((calls) => {
+        for (const call of calls) {
+          const peerId = call.callerId === userId ? call.receiverId : call.callerId;
+          if (peerId) {
+            this.sendTo(peerId, {
+              type: "call.end",
+              callId: call.id,
+              from: userId,
+              endedAt: call.endedAt,
+              reason: "Friend disconnected"
+            });
+          }
+        }
+      }).catch(() => undefined).finally(() => {
+        if (this.disconnectCleanups.get(userId) === cleanup) {
+          this.disconnectCleanups.delete(userId);
+        }
+      });
+    }, DISCONNECT_CALL_GRACE_MS);
+    cleanup.timer.unref();
+    this.disconnectCleanups.set(userId, cleanup);
+  }
+
   private sendTo(userId: string, payload: unknown): boolean {
     const sockets = this.clients.get(userId);
     if (!sockets?.size) return false;
@@ -219,8 +328,19 @@ export class SignalingHub implements PresenceReader {
     if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
   }
 
-  private sendError(socket: WebSocket, code: string, message: string): void {
-    this.send(socket, { type: "error", code, message });
+  private sendError(socket: WebSocket, code: string, message: string, requestId?: string): void {
+    this.send(socket, { type: "error", code, message, ...(requestId ? { requestId } : {}) });
+  }
+
+  private readRequestId(raw: string): string | undefined {
+    try {
+      const value = JSON.parse(raw) as { requestId?: unknown };
+      return typeof value.requestId === "string" && value.requestId.length <= 100
+        ? value.requestId
+        : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private checkHeartbeats(): void {
@@ -230,3 +350,5 @@ export class SignalingHub implements PresenceReader {
     }
   }
 }
+
+const DISCONNECT_CALL_GRACE_MS = 60_000;

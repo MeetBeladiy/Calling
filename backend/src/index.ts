@@ -10,6 +10,10 @@ const config = loadConfig();
 const store = await FileStore.open(config.dataFile);
 const tokens = new TokenService(config, store);
 const calls = new CallService(store);
+// A backend restart destroys every signaling socket. Any persisted ringing or
+// connected call predates this process and cannot be resumed safely; release it
+// so neither account is permanently blocked after a deploy or crash.
+await calls.failAllActiveCalls();
 const presencePlaceholder = { isOnline: (_userId: string) => false };
 const app = createApp({ config, store, tokens, calls, presence: presencePlaceholder });
 const server = createServer(app);

@@ -99,8 +99,74 @@ class CallStateMachineTest {
         )
 
         assertEquals(CallStage.VOIP_DISCONNECTED, failed.stage)
+        assertEquals(CallQuality.UNKNOWN, failed.quality)
         assertFalse(failed.hasLiveSession)
         assertTrue(failed.shouldShowCallUi)
+    }
+
+    @Test
+    fun `accept immediately leaves ringing UI and shows secure negotiation`() {
+        val ringing = CallStateMachine.reduce(
+            CallState(),
+            CallEvent.ReceiveIncoming("call-1", "friend-1", "Meet", 100)
+        )
+
+        val accepting = CallStateMachine.reduce(ringing, CallEvent.Negotiating("call-1"))
+
+        assertEquals(CallStage.NEGOTIATING, accepting.stage)
+        assertTrue(accepting.incoming)
+        assertEquals("Connecting secure audio…", accepting.statusMessage)
+    }
+
+    @Test
+    fun `failed accept returns to actionable ringing state`() {
+        val ringing = CallStateMachine.reduce(
+            CallState(),
+            CallEvent.ReceiveIncoming("call-1", "friend-1", "Meet", 100)
+        )
+        val accepting = CallStateMachine.reduce(ringing, CallEvent.Negotiating("call-1"))
+
+        val retryable = CallStateMachine.reduce(
+            accepting,
+            CallEvent.AcceptFailed("call-1", "Could not accept. Tap Accept again.")
+        )
+
+        assertEquals(CallStage.RINGING, retryable.stage)
+        assertEquals("Could not accept. Tap Accept again.", retryable.statusMessage)
+    }
+
+    @Test
+    fun `only actual network loss is labelled no internet`() {
+        val active = CallState(
+            stage = CallStage.NEGOTIATING,
+            callId = "call-1",
+            diagnostics = CallDiagnostics(networkLabel = "Wi-Fi")
+        )
+
+        val negotiationFailure = CallStateMachine.reduce(
+            active,
+            CallEvent.Failed("call-1", "Unable to secure call audio")
+        )
+        val networkFailure = CallStateMachine.reduce(active, CallEvent.NetworkLost("call-1"))
+
+        assertEquals(CallQuality.UNKNOWN, negotiationFailure.quality)
+        assertEquals(CallQuality.NO_INTERNET, networkFailure.quality)
+    }
+
+    @Test
+    fun `manual retry moves failed call back to reconnecting`() {
+        val failed = CallState(
+            stage = CallStage.VOIP_DISCONNECTED,
+            callId = "call-1",
+            peerId = "friend-1",
+            statusMessage = "Unable to secure call audio"
+        )
+
+        val retrying = CallStateMachine.reduce(failed, CallEvent.RetryStarted("call-1"))
+
+        assertEquals(CallStage.RECONNECTING, retrying.stage)
+        assertTrue(retrying.hasLiveSession)
+        assertEquals("Reconnecting secure audio…", retrying.statusMessage)
     }
 
     @Test

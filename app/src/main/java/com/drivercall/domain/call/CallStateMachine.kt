@@ -27,8 +27,11 @@ class CallStateMachine(initialState: CallState = CallState()) {
                 is CallEvent.ReceiveIncoming -> event.callId
                 is CallEvent.AssignServerCallId -> event.provisionalCallId
                 is CallEvent.RemoteRinging -> event.callId
+                is CallEvent.Negotiating -> event.callId
+                is CallEvent.AcceptFailed -> event.callId
                 is CallEvent.Connected -> event.callId
                 is CallEvent.NetworkLost -> event.callId
+                is CallEvent.RetryStarted -> event.callId
                 is CallEvent.NetworkAvailable -> event.callId
                 is CallEvent.IceRestartSucceeded -> event.callId
                 is CallEvent.QualityChanged -> event.callId
@@ -76,10 +79,25 @@ class CallStateMachine(initialState: CallState = CallState()) {
                 is CallEvent.RemoteRinging -> current.takeIf {
                     it.stage == CallStage.OUTGOING_VOIP_CALL
                 }?.copy(stage = CallStage.RINGING, statusMessage = "Ringing…") ?: current
+                is CallEvent.Negotiating -> current.takeIf {
+                    it.stage in setOf(CallStage.OUTGOING_VOIP_CALL, CallStage.RINGING)
+                }?.copy(
+                    stage = CallStage.NEGOTIATING,
+                    quality = CallQuality.UNKNOWN,
+                    statusMessage = "Connecting secure audio…"
+                ) ?: current
+                is CallEvent.AcceptFailed -> current.takeIf {
+                    it.incoming && it.stage == CallStage.NEGOTIATING
+                }?.copy(
+                    stage = CallStage.RINGING,
+                    quality = CallQuality.UNKNOWN,
+                    statusMessage = event.reason
+                ) ?: current
                 is CallEvent.Connected -> current.takeIf {
                     it.stage in setOf(
                         CallStage.OUTGOING_VOIP_CALL,
                         CallStage.RINGING,
+                        CallStage.NEGOTIATING,
                         CallStage.RECONNECTING,
                         CallStage.RESTORING_VOIP,
                         CallStage.VOIP_RESTORED
@@ -95,6 +113,13 @@ class CallStateMachine(initialState: CallState = CallState()) {
                     quality = CallQuality.NO_INTERNET,
                     statusMessage = "Internet connection lost. Trying to reconnect…",
                     diagnostics = current.diagnostics.copy(networkLabel = "No internet")
+                ) ?: current
+                is CallEvent.RetryStarted -> current.takeIf {
+                    it.stage in setOf(CallStage.VOIP_DISCONNECTED, CallStage.RECONNECTING)
+                }?.copy(
+                    stage = CallStage.RECONNECTING,
+                    quality = CallQuality.UNKNOWN,
+                    statusMessage = "Reconnecting secure audio…"
                 ) ?: current
                 is CallEvent.NetworkAvailable -> current.copy(
                     statusMessage = if (current.stage == CallStage.RECONNECTING) {
@@ -164,7 +189,11 @@ class CallStateMachine(initialState: CallState = CallState()) {
                 is CallEvent.SetAudioRoute -> current.copy(audioRoute = event.route)
                 is CallEvent.Failed -> current.copy(
                     stage = CallStage.VOIP_DISCONNECTED,
-                    quality = CallQuality.NO_INTERNET,
+                    quality = if (current.diagnostics.networkLabel == "No internet") {
+                        CallQuality.NO_INTERNET
+                    } else {
+                        CallQuality.UNKNOWN
+                    },
                     statusMessage = event.reason
                 )
                 is CallEvent.Ended -> current.copy(

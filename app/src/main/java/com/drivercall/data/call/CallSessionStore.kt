@@ -17,7 +17,9 @@ data class PersistedCallSession(
     val startedAtEpochMs: Long,
     val connectedAtEpochMs: Long?,
     val muted: Boolean,
-    val reconnectionCount: Int
+    val reconnectionCount: Int,
+    val incoming: Boolean = false,
+    val stage: CallStage? = null
 )
 
 /** Saves only restoration metadata, never media or a customer's phone number. */
@@ -48,28 +50,16 @@ class CallSessionStore @Inject constructor(
             startedAt,
             state.connectedAtEpochMs,
             state.muted,
-            state.diagnostics.reconnectionCount
+            state.diagnostics.reconnectionCount,
+            state.incoming,
+            state.stage
         )
         preferences.edit().putString(KEY_SESSION, gson.toJson(persisted)).apply()
     }
 
     fun restore(): CallState? = preferences.getString(KEY_SESSION, null)?.let { json ->
         runCatching { gson.fromJson(json, PersistedCallSession::class.java) }.getOrNull()
-    }?.let {
-        CallState(
-            stage = CallStage.VOIP_DISCONNECTED,
-            callId = it.callId,
-            peerId = it.peerId,
-            peerName = it.peerName,
-            startedAtEpochMs = it.startedAtEpochMs,
-            connectedAtEpochMs = it.connectedAtEpochMs,
-            muted = it.muted,
-            diagnostics = com.drivercall.domain.call.CallDiagnostics(
-                reconnectionCount = it.reconnectionCount
-            ),
-            statusMessage = "Previous call was interrupted. Start a new call to reconnect."
-        )
-    }
+    }?.toCallState()
 
     fun clear() {
         preferences.edit().remove(KEY_SESSION).apply()
@@ -79,4 +69,27 @@ class CallSessionStore @Inject constructor(
         const val KEY_SESSION = "active_call"
     }
 }
+
+internal fun PersistedCallSession.toCallState(): CallState = CallState(
+    stage = stage ?: if (connectedAtEpochMs != null) {
+        CallStage.CONNECTED
+    } else {
+        CallStage.VOIP_DISCONNECTED
+    },
+    callId = callId,
+    peerId = peerId,
+    peerName = peerName,
+    incoming = incoming,
+    startedAtEpochMs = startedAtEpochMs,
+    connectedAtEpochMs = connectedAtEpochMs,
+    muted = muted,
+    diagnostics = com.drivercall.domain.call.CallDiagnostics(
+        reconnectionCount = reconnectionCount
+    ),
+    statusMessage = if (incoming && stage == CallStage.RINGING) {
+        "Incoming call"
+    } else {
+        "Previous call was interrupted. Tap Retry to reconnect."
+    }
+)
 
