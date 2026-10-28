@@ -25,7 +25,7 @@ Data is written to `DATA_FILE` as an atomic JSON snapshot. The `Store` interface
 
 ## Configuration
 
-See `.env.example`. In production, set a random `JWT_SECRET` of at least 32 characters, serve only behind HTTPS/WSS, configure the correct `CORS_ORIGINS` and proxy setting, and supply a real TURN service. `STUN_URLS` and `TURN_URLS` are comma-separated. TURN credentials returned by this MVP are static; production should issue short-lived TURN credentials.
+See `.env.example`. In production, set a random `JWT_SECRET` of at least 32 characters, serve only behind HTTPS/WSS, configure the correct `CORS_ORIGINS` and proxy setting, and supply a real TURN service. `STUN_URLS` and `TURN_URLS` are comma-separated. Static `TURN_USERNAME`/`TURN_CREDENTIAL` values are supported, while `TURN_CREDENTIALS_URL` is the preferred backend-only HTTPS endpoint for a managed provider's complete, rotating ICE-server array.
 
 ## Authentication
 

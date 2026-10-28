@@ -92,6 +92,7 @@ sealed interface CallEvent {
     data class AcceptFailed(val callId: String, val reason: String) : CallEvent
     data class Connected(val callId: String, val nowEpochMs: Long) : CallEvent
     data class NetworkLost(val callId: String) : CallEvent
+    data class ConnectionInterrupted(val callId: String) : CallEvent
     data class RetryStarted(val callId: String) : CallEvent
     data class NetworkAvailable(val callId: String, val label: String) : CallEvent
     data class IceRestartSucceeded(val callId: String) : CallEvent

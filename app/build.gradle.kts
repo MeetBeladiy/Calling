@@ -26,19 +26,23 @@ android {
         .orElse("")
     val turnCredential = providers.gradleProperty("CALLING_APP_TURN_CREDENTIAL")
         .orElse("")
+    val requireTurn = providers.gradleProperty("CALLING_APP_REQUIRE_TURN")
+        .map { it.equals("true", ignoreCase = true) }
+        .orElse(true)
 
     defaultConfig {
         applicationId = "com.drivercall"
         minSdk = 26
         targetSdk = 36
-        versionCode = 8
-        versionName = "0.8.7-mvp"
+        versionCode = 9
+        versionName = "0.8.8-mvp"
 
         buildConfigField("String", "BASE_URL", "\"${apiBaseUrl.get()}\"")
         buildConfigField("String", "SIGNALING_URL", "\"${signalingUrl.get()}\"")
         buildConfigField("String", "TURN_URL", "\"${turnUrl.get()}\"")
         buildConfigField("String", "TURN_USERNAME", "\"${turnUsername.get()}\"")
         buildConfigField("String", "TURN_CREDENTIAL", "\"${turnCredential.get()}\"")
+        buildConfigField("boolean", "REQUIRE_TURN", requireTurn.get().toString())
         manifestPlaceholders["usesCleartextTraffic"] = "true"
     }
 

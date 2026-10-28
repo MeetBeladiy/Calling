@@ -24,9 +24,14 @@ DATA_FILE=/data/calling-app.json
 TRUST_PROXY=true
 CORS_ORIGINS=https://your-future-admin-domain.example
 STUN_URLS=stun:stun.l.google.com:19302
-TURN_URLS=turn:turn.example.com:3478,turns:turn.example.com:5349
-TURN_USERNAME=<temporary-development-username>
-TURN_CREDENTIAL=<temporary-development-credential>
+# Preferred managed-provider option. This backend-only HTTPS URL returns the
+# complete ICE server array and may contain a credential-scoped API key.
+TURN_CREDENTIALS_URL=https://YOUR_TURN_PROVIDER/credentials?apiKey=YOUR_KEY
+
+# Alternative static credential option:
+TURN_URLS=turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp,turns:turn.example.com:443?transport=tcp
+TURN_USERNAME=<turn-username>
+TURN_CREDENTIAL=<turn-credential>
 ```
 
 Generate `JWT_SECRET` in a password manager or with a cryptographically secure generator. Do not commit it. The JSON volume supports one production pilot instance only; migrate the `Store` abstraction to PostgreSQL and shared presence/rate limiting before running multiple replicas.
@@ -44,7 +49,7 @@ Railway provides automatic certificates for its public domains. Its current depl
 
 STUN alone is not reliable across carrier-grade NAT, office networks, and restrictive Wi-Fi. Use a managed TURN provider or deploy coturn on a public VM that permits UDP/TCP 3478, TLS 5349, and a bounded UDP relay range. Configure authentication, quotas, abuse monitoring, and TLS. Prefer short-lived credentials issued by the backend rather than permanent APK credentials.
 
-Set the resulting TURN values in the backend service variables. The Android client fetches the authenticated ICE configuration from `/api/config/ice` when it creates a peer connection.
+Set either `TURN_CREDENTIALS_URL` or all three static TURN values in the backend service variables. The Android client fetches the authenticated ICE configuration from `/api/config/ice` when it creates a peer connection. The response must report `relayReady: true`; `/health` reports `mediaRelay: "configured"` only when a relay source is present, without claiming that an external provider is reachable or exposing credentials. A variable name with a blank value is not a configured relay.
 
 The official coturn container documentation is at <https://github.com/coturn/coturn/blob/master/docker/coturn/README.md>.
 
@@ -66,6 +71,7 @@ Replace `YOUR_DOMAIN` with the deployed public hostname:
 .\gradlew.bat `
   -PCALLING_APP_BASE_URL=https://YOUR_DOMAIN/ `
   -PCALLING_APP_SIGNALING_URL=wss://YOUR_DOMAIN/ws `
+  -PCALLING_APP_REQUIRE_TURN=true `
   :app:assembleDebug
 ```
 

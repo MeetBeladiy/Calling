@@ -37,6 +37,10 @@ data class RtcIceCandidate(
 
 enum class RtcConnectionState { NEW, CONNECTING, CONNECTED, DISCONNECTED, FAILED, CLOSED }
 
+/** A call cannot be made reliable across carrier NAT without an authenticated relay. */
+class RtcConfigurationException(message: String, cause: Throwable? = null) :
+    IllegalStateException(message, cause)
+
 interface WebRtcListener {
     fun onLocalIceCandidate(candidate: RtcIceCandidate)
     fun onConnectionStateChanged(state: RtcConnectionState)
@@ -102,22 +106,43 @@ class AndroidWebRtcEngine @Inject constructor(
     }
 
     private suspend fun loadIceServers(): List<PeerConnection.IceServer> {
-        val fromBackend = runCatching {
-            configApi.getIceConfig().iceServers.flatMap { it.toNative() }
-        }.getOrDefault(emptyList())
-        if (fromBackend.isNotEmpty()) return fromBackend
-
-        return buildList {
-            add(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer())
+        val backendResult = runCatching { configApi.getIceConfig() }
+        val backendServers = backendResult.getOrNull()?.iceServers.orEmpty()
+        val configuredServers = buildList {
+            addAll(backendServers)
             if (BuildConfig.TURN_URL.isNotBlank()) {
                 add(
-                    PeerConnection.IceServer.builder(BuildConfig.TURN_URL)
-                        .setUsername(BuildConfig.TURN_USERNAME)
-                        .setPassword(BuildConfig.TURN_CREDENTIAL)
-                        .createIceServer()
+                    IceServerDto(
+                        urls = listOf(BuildConfig.TURN_URL),
+                        username = BuildConfig.TURN_USERNAME,
+                        credential = BuildConfig.TURN_CREDENTIAL
+                    )
                 )
             }
+        }.mapNotNull(IceServerDto::normalized)
+
+        if (BuildConfig.REQUIRE_TURN && !configuredServers.hasAuthenticatedTurn()) {
+            val failure = backendResult.exceptionOrNull()
+            if (failure != null) {
+                throw RtcConfigurationException(
+                    "Could not load the secure call relay. Check your connection and try again.",
+                    failure
+                )
+            }
+            throw RtcConfigurationException(
+                "Secure call relay is unavailable. Please try again shortly."
+            )
         }
+
+        val nativeServers = configuredServers.flatMap { it.toNative() }
+        if (nativeServers.isNotEmpty()) return nativeServers
+
+        // Explicit local-development opt-out only. Production builds require an
+        // authenticated TURN relay and never silently degrade to STUN-only.
+        return listOf(
+            PeerConnection.IceServer.builder("stun:stun.l.google.com:19302")
+                .createIceServer()
+        )
     }
 
     private fun IceServerDto.toNative(): List<PeerConnection.IceServer> = urls.map { url ->
@@ -130,7 +155,10 @@ class AndroidWebRtcEngine @Inject constructor(
     private fun createPeerConnection(servers: List<PeerConnection.IceServer>): PeerConnection {
         val configuration = PeerConnection.RTCConfiguration(servers).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+            iceTransportsType = PeerConnection.IceTransportsType.ALL
+            tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.ENABLED
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            iceCandidatePoolSize = 2
             bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
             rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
             keyType = PeerConnection.KeyType.ECDSA
@@ -392,6 +420,31 @@ class AndroidWebRtcEngine @Inject constructor(
         }
     }
 }
+
+internal fun IceServerDto.normalized(): IceServerDto? {
+    val normalizedUrls = urls.mapNotNull { raw ->
+        val value = raw.trim()
+        val scheme = value.substringBefore(':', missingDelimiterValue = "").lowercase()
+        value.takeIf { scheme in SUPPORTED_ICE_SCHEMES }
+    }.distinct()
+    if (normalizedUrls.isEmpty()) return null
+    return copy(
+        urls = normalizedUrls,
+        username = username?.trim(),
+        credential = credential?.trim()
+    )
+}
+
+internal fun List<IceServerDto>.hasAuthenticatedTurn(): Boolean = any { server ->
+    server.username?.isNotBlank() == true &&
+        server.credential?.isNotBlank() == true &&
+        server.urls.any { url ->
+            url.substringBefore(':', missingDelimiterValue = "").lowercase() in TURN_SCHEMES
+        }
+}
+
+private val SUPPORTED_ICE_SCHEMES = setOf("stun", "stuns", "turn", "turns")
+private val TURN_SCHEMES = setOf("turn", "turns")
 
 private open class SimpleSdpObserver : SdpObserver {
     override fun onCreateSuccess(description: SessionDescription) = Unit

@@ -11,7 +11,12 @@ data class IceServerDto(
 
 data class IceConfigResponse(
     @SerializedName("iceServers") val iceServers: List<IceServerDto>,
-    @SerializedName("ttlSeconds") val ttlSeconds: Long
+    @SerializedName("ttlSeconds") val ttlSeconds: Long = 3_600,
+    /**
+     * Non-secret backend readiness hint. The RTC layer still validates the
+     * returned URLs and credentials rather than trusting this flag alone.
+     */
+    @SerializedName("relayReady") val relayReady: Boolean = false
 )
 
 interface ConfigApi {

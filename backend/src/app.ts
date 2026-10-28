@@ -41,7 +41,17 @@ export function createApp(dependencies: {
   app.use(express.json({ limit: "128kb" }));
   app.use(rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: "draft-7", legacyHeaders: false }));
 
-  app.get("/health", (_request, response) => response.json({ status: "ok", service: "calling-app-backend", time: new Date().toISOString() }));
+  const staticRelayConfigured = config.turnUrls.length > 0 &&
+    Boolean(config.turnUsername.trim()) && Boolean(config.turnCredential.trim());
+  const mediaRelay = staticRelayConfigured || Boolean(config.turnCredentialsUrl)
+    ? "configured"
+    : "not_configured";
+  app.get("/health", (_request, response) => response.json({
+    status: "ok",
+    service: "calling-app-backend",
+    mediaRelay,
+    time: new Date().toISOString()
+  }));
   app.use("/api/auth", createAuthRouter(store, tokens));
 
   const requireAuth = authenticate(tokens, store);

@@ -43,6 +43,7 @@ Never commit a populated environment file. The implementation may split these va
 | `FCM_PRIVATE_KEY` | Reserved push private key | Secret store; preserve newlines correctly |
 | `TURN_URLS` | Comma-separated TURN URIs | Include TLS relay endpoint |
 | `TURN_USERNAME`, `TURN_CREDENTIAL` | Current static TURN credentials | Development boundary only; replace with short-lived server-issued credentials for production |
+| `TURN_CREDENTIALS_URL` | Backend-only HTTPS endpoint returning an `iceServers` array | Preferred for managed TURN; may contain a credential-scoped API key and must never be committed or logged |
 | `STUN_URLS` | STUN URIs exposed to clients | Environment-specific |
 
 If Firebase uses workload identity or an attached service account, omit raw credential variables. Never place a service-account JSON file in the Android client.
@@ -62,9 +63,10 @@ The WebSocket accepts bearer authentication (header preferred; query token is su
 1. The Android project requires JDK 17, uses `minSdk 26` and `compileSdk/targetSdk 36`, and builds the `com.drivercall` application. Its calling stack includes AndroidX Core-Telecom 1.0.1 and the WebRTC SDK.
 2. Configure `CALLING_APP_BASE_URL` and `CALLING_APP_SIGNALING_URL` in user-level Gradle properties or on the Gradle command line. Production must use `https://` and `wss://`.
 3. Prefer ICE configuration from the authenticated backend endpoint. The current optional Gradle keys `CALLING_APP_TURN_URL`, `CALLING_APP_TURN_USERNAME`, and `CALLING_APP_TURN_CREDENTIAL` must not contain long-lived production secrets because APK values are extractable.
-4. Configure notification channel IDs, deep links, foreground-service types, application ID, versioning, and signing per environment.
-5. Restrict backup/data-extraction rules so tokens, keys, and sensitive databases are excluded.
-6. Use Android Keystore-backed encrypted storage for refresh/session tokens. Never store passwords.
+4. `CALLING_APP_REQUIRE_TURN` defaults to `true`, so a global build fails call setup clearly when the backend has no authenticated `turn:` or `turns:` relay. Set it to `false` only for deliberate local/LAN development.
+5. Configure notification channel IDs, deep links, foreground-service types, application ID, versioning, and signing per environment.
+6. Restrict backup/data-extraction rules so tokens, keys, and sensitive databases are excluded.
+7. Use Android Keystore-backed encrypted storage for refresh/session tokens. Never store passwords.
 
 Typical local addressing:
 
@@ -88,7 +90,7 @@ The checked-in build permits cleartext in debug for emulator development and dis
 
 ## TURN configuration
 
-STUN alone is insufficient for production. Operate TURN with authentication, UDP and TCP listeners, TLS on 443 where possible, appropriate relay port ranges/firewalls, quotas, abuse monitoring, and regional capacity. Generate short-lived credentials server-side. Verify relay-only calls during pre-release testing; a successful LAN/direct call does not prove TURN works.
+STUN alone is insufficient for production. Operate TURN with authentication, UDP and TCP listeners, TLS on 443 where possible, appropriate relay port ranges/firewalls, quotas, abuse monitoring, and regional capacity. Generate short-lived credentials server-side. For a managed provider, store its credential-scoped HTTPS ICE endpoint in `TURN_CREDENTIALS_URL`; the backend validates, briefly caches, and proxies the returned configuration without exposing that provider URL to the APK. Verify `relayReady: true` from authenticated `/api/config/ice` and then verify relay-only calls during pre-release testing; a successful LAN/direct call does not prove TURN works.
 
 ## Local validation
 

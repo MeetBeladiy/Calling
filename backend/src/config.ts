@@ -17,7 +17,8 @@ const schema = z.object({
   STUN_URLS: z.string().default("stun:stun.l.google.com:19302"),
   TURN_URLS: z.string().default(""),
   TURN_USERNAME: z.string().default(""),
-  TURN_CREDENTIAL: z.string().default("")
+  TURN_CREDENTIAL: z.string().default(""),
+  TURN_CREDENTIALS_URL: z.string().default("")
 });
 
 export type AppConfig = {
@@ -35,6 +36,7 @@ export type AppConfig = {
   turnUrls: string[];
   turnUsername: string;
   turnCredential: string;
+  turnCredentialsUrl: string;
 };
 
 export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -43,6 +45,18 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     throw new Error("JWT_SECRET must be set to a strong random value in production");
   }
   const split = (value: string) => value.split(",").map((item) => item.trim()).filter(Boolean);
+  const turnCredentialsUrl = parsed.TURN_CREDENTIALS_URL.trim();
+  if (turnCredentialsUrl) {
+    let protocol: string;
+    try {
+      protocol = new URL(turnCredentialsUrl).protocol;
+    } catch {
+      throw new Error("TURN_CREDENTIALS_URL must be a valid URL");
+    }
+    if (protocol !== "https:") {
+      throw new Error("TURN_CREDENTIALS_URL must use HTTPS");
+    }
+  }
   return {
     env: parsed.NODE_ENV,
     host: parsed.HOST,
@@ -57,6 +71,7 @@ export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
     stunUrls: split(parsed.STUN_URLS),
     turnUrls: split(parsed.TURN_URLS),
     turnUsername: parsed.TURN_USERNAME,
-    turnCredential: parsed.TURN_CREDENTIAL
+    turnCredential: parsed.TURN_CREDENTIAL,
+    turnCredentialsUrl
   };
 }

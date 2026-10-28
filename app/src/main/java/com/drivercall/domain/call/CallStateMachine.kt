@@ -22,6 +22,13 @@ class CallStateMachine(initialState: CallState = CallState()) {
         fun reduce(current: CallState, event: CallEvent): CallState {
             if (event is CallEvent.Reset) return CallState()
 
+            // Terminal calls must not be resurrected by queued WebRTC, signaling,
+            // diagnostics, or network callbacks. IDLE likewise accepts only the
+            // two events that intentionally create a new call.
+            if (current.stage in setOf(CallStage.IDLE, CallStage.CALL_ENDED) &&
+                event !is CallEvent.StartOutgoing && event !is CallEvent.ReceiveIncoming
+            ) return current
+
             val eventCallId = when (event) {
                 is CallEvent.StartOutgoing -> event.callId
                 is CallEvent.ReceiveIncoming -> event.callId
@@ -31,6 +38,7 @@ class CallStateMachine(initialState: CallState = CallState()) {
                 is CallEvent.AcceptFailed -> event.callId
                 is CallEvent.Connected -> event.callId
                 is CallEvent.NetworkLost -> event.callId
+                is CallEvent.ConnectionInterrupted -> event.callId
                 is CallEvent.RetryStarted -> event.callId
                 is CallEvent.NetworkAvailable -> event.callId
                 is CallEvent.IceRestartSucceeded -> event.callId
@@ -113,6 +121,19 @@ class CallStateMachine(initialState: CallState = CallState()) {
                     quality = CallQuality.NO_INTERNET,
                     statusMessage = "Internet connection lost. Trying to reconnect…",
                     diagnostics = current.diagnostics.copy(networkLabel = "No internet")
+                ) ?: current
+                is CallEvent.ConnectionInterrupted -> current.takeIf {
+                    it.stage in setOf(
+                        CallStage.CONNECTED,
+                        CallStage.POOR_CONNECTION,
+                        CallStage.RECONNECTING,
+                        CallStage.RESTORING_VOIP,
+                        CallStage.VOIP_RESTORED
+                    )
+                }?.copy(
+                    stage = CallStage.RECONNECTING,
+                    quality = CallQuality.UNKNOWN,
+                    statusMessage = "Secure audio interrupted. Reconnecting…"
                 ) ?: current
                 is CallEvent.RetryStarted -> current.takeIf {
                     it.stage in setOf(CallStage.VOIP_DISCONNECTED, CallStage.RECONNECTING)

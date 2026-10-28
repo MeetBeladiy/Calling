@@ -154,6 +154,56 @@ class CallStateMachineTest {
     }
 
     @Test
+    fun `media interruption is not mislabeled as internet loss`() {
+        val connected = CallState(
+            stage = CallStage.CONNECTED,
+            callId = "call-1",
+            peerId = "friend-1",
+            connectedAtEpochMs = 200,
+            quality = CallQuality.GOOD,
+            diagnostics = CallDiagnostics(networkLabel = "Mobile data")
+        )
+
+        val reconnecting = CallStateMachine.reduce(
+            connected,
+            CallEvent.ConnectionInterrupted("call-1")
+        )
+
+        assertEquals(CallStage.RECONNECTING, reconnecting.stage)
+        assertEquals(CallQuality.UNKNOWN, reconnecting.quality)
+        assertEquals("Mobile data", reconnecting.diagnostics.networkLabel)
+        assertEquals("Secure audio interrupted. Reconnecting…", reconnecting.statusMessage)
+    }
+
+    @Test
+    fun `late failures cannot resurrect an ended or reset call`() {
+        val ended = CallState(
+            stage = CallStage.CALL_ENDED,
+            callId = "call-1",
+            statusMessage = "Call ended"
+        )
+
+        val afterFailure = CallStateMachine.reduce(
+            ended,
+            CallEvent.Failed("call-1", "Unable to reconnect")
+        )
+        val afterNetwork = CallStateMachine.reduce(
+            ended,
+            CallEvent.NetworkLost("call-1")
+        )
+        val reset = CallStateMachine.reduce(ended, CallEvent.Reset)
+        val afterResetFailure = CallStateMachine.reduce(
+            reset,
+            CallEvent.Failed("call-1", "Unable to reconnect")
+        )
+
+        assertEquals(ended, afterFailure)
+        assertEquals(ended, afterNetwork)
+        assertEquals(CallStage.IDLE, afterResetFailure.stage)
+        assertFalse(afterResetFailure.shouldShowCallUi)
+    }
+
+    @Test
     fun `manual retry moves failed call back to reconnecting`() {
         val failed = CallState(
             stage = CallStage.VOIP_DISCONNECTED,
